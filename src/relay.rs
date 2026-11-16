@@ -7,6 +7,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep};
 
+use crate::metrics::TransferCounters;
+
 const BUFFER_SIZE: usize = 16 * 1024;
 
 /// Bytes copied in each direction.
@@ -21,10 +23,14 @@ pub struct Transferred {
 /// When one side stops sending, the write half of the other side is shut down
 /// (TCP half-close) and the remaining direction keeps flowing. The connection is
 /// dropped if no byte moves in either direction for `idle_timeout`.
+///
+/// `counters` are bumped as bytes move, so long-lived connections show up in
+/// metrics while they are still open.
 pub async fn relay(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
     idle_timeout: Duration,
+    counters: &TransferCounters,
 ) -> Result<Transferred> {
     let (mut client_read, mut client_write) = client.split();
     let (mut upstream_read, mut upstream_write) = upstream.split();
@@ -49,6 +55,7 @@ pub async fn relay(
                 } else {
                     upstream_write.write_all(&to_upstream[..n]).await?;
                     transferred.sent += n as u64;
+                    counters.sent.inc_by(n as u64);
                 }
             }
             read = upstream_read.read(&mut to_client), if upstream_open => {
@@ -59,6 +66,7 @@ pub async fn relay(
                 } else {
                     client_write.write_all(&to_client[..n]).await?;
                     transferred.received += n as u64;
+                    counters.received.inc_by(n as u64);
                 }
             }
             () = &mut idle => bail!("idle for {}", humantime::format_duration(idle_timeout)),
