@@ -171,3 +171,14 @@ async fn active_connections_are_not_closed() {
     let read = timeout(Duration::from_millis(50), client.read(&mut buf)).await;
     assert!(read.is_err(), "connection was closed while active");
 }
+
+#[tokio::test]
+async fn dropping_health_checks_stops_them() {
+    let pool = Arc::new(Pool::new([dead_addr().await], Algorithm::RoundRobin).unwrap());
+    let checks = strait::spawn_health_checks(&pool, fast_health_checks());
+    drop(checks);
+
+    // Running checks would mark the dead backend unhealthy within ~40ms.
+    sleep(Duration::from_millis(200)).await;
+    assert!(pool.backends()[0].is_healthy());
+}
