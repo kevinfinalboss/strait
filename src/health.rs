@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tracing::{info, warn};
 
@@ -33,11 +34,29 @@ impl Default for HealthCheck {
     }
 }
 
-/// Starts one background task per backend that keeps its health flag up to date.
-pub fn spawn(pool: &Pool, config: HealthCheck) {
-    for backend in pool.backends() {
-        tokio::spawn(watch(Arc::clone(backend), config));
+/// The running health check tasks of one pool. Dropping it stops them.
+#[must_use = "health checks stop as soon as this is dropped"]
+#[derive(Debug)]
+pub struct HealthChecks {
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Drop for HealthChecks {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
     }
+}
+
+/// Starts one background task per backend that keeps its health flag up to date.
+pub fn spawn(pool: &Pool, config: HealthCheck) -> HealthChecks {
+    let tasks = pool
+        .backends()
+        .iter()
+        .map(|backend| tokio::spawn(watch(Arc::clone(backend), config)))
+        .collect();
+    HealthChecks { tasks }
 }
 
 async fn watch(backend: Arc<Backend>, config: HealthCheck) {
