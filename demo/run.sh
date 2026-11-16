@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs strait in front of local demo backends and drives traffic through it.
-# Usage: demo/run.sh [balance|least-conn|failover|affinity|all]
+# Usage: demo/run.sh [balance|least-conn|failover|affinity|reload|all]
 
 set -euo pipefail
 
@@ -124,6 +124,39 @@ scenario_affinity() {
     stop_all
 }
 
+write_config() {
+    {
+        echo "listeners:"
+        echo "  - name: demo"
+        echo "    listen: $LISTEN"
+        echo "    health_check: {interval: 300ms}"
+        echo "    backends:"
+        for port in "$@"; do
+            echo "      - 127.0.0.1:$port"
+        done
+    } >"$LOGS/strait.yaml"
+}
+
+scenario_reload() {
+    header "reload" "Starts with backends a and b. At second 3 the config is rewritten to b and c and strait gets SIGHUP. Expect a to stop getting new connections, c to start, and no errors."
+    start_backends
+    write_config 9101 9102
+    "$STRAIT" --config "$LOGS/strait.yaml" >"$LOGS/strait.log" 2>&1 &
+    echo $! >"$LOGS/strait.pid"
+    wait_for_port "${LISTEN##*:}"
+    (
+        sleep 3
+        write_config 9102 9103
+        kill -HUP "$(cat "$LOGS/strait.pid")"
+    ) &
+    local timer=$!
+    python3 "$DEMO/load.py" --target "$LISTEN" --clients 20 --duration 6
+    wait "$timer"
+    printf '\nreload events from strait:\n'
+    sed 's/\x1b\[[0-9;]*m//g' "$LOGS/strait.log" | grep -E 'reload' | cut -c29- || true
+    stop_all
+}
+
 main() {
     local scenario=${1:-all}
 
@@ -135,14 +168,16 @@ main() {
         least-conn) scenario_least_conn ;;
         failover) scenario_failover ;;
         affinity) scenario_affinity ;;
+        reload) scenario_reload ;;
         all)
             scenario_balance
             scenario_least_conn
             scenario_failover
             scenario_affinity
+            scenario_reload
             ;;
         *)
-            echo "usage: $0 [balance|least-conn|failover|affinity|all]" >&2
+            echo "usage: $0 [balance|least-conn|failover|affinity|reload|all]" >&2
             exit 1
             ;;
     esac
