@@ -77,6 +77,9 @@ async fn handle(
     let (lease, mut upstream) = connect(pool, peer, config).await?;
     let backend = lease.addr();
 
+    client.set_nodelay(true)?;
+    upstream.set_nodelay(true)?;
+
     info!(%peer, %backend, "connection opened");
 
     let transferred = relay(&mut client, &mut upstream, config.idle_timeout)
