@@ -7,6 +7,8 @@ timeline and, with --sources, whether each client IP stayed on one backend.
 """
 
 import argparse
+import os
+import re
 import socket
 import threading
 import time
@@ -22,29 +24,46 @@ class Result:
     latency: float
 
 
-def request(target: tuple[str, int], source: str | None, timeout: float) -> str:
-    """Sends one HTTP/1.0 GET and returns the backend name from the response body."""
+def request(
+    target: tuple[str, int], source: str | None, timeout: float, pattern: re.Pattern | None
+) -> str:
+    """Sends one HTTP/1.0 GET and returns the backend name from the response body.
+
+    Without `pattern` the whole body is the name; with it, the first capture group.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
         if source:
             sock.bind((source, 0))
         sock.connect(target)
         sock.sendall(b"GET / HTTP/1.0\r\nHost: strait-demo\r\n\r\n")
-        chunks = []
+        data = b""
         while chunk := sock.recv(4096):
-            chunks.append(chunk)
+            data += chunk
+            # Stop once the body is complete instead of waiting for the server to
+            # close, which some proxies (kubectl port-forward) take a second to relay.
+            head, sep, body = data.partition(b"\r\n\r\n")
+            length = re.search(rb"(?im)^content-length:\s*(\d+)", head)
+            if sep and length and len(body) >= int(length.group(1)):
+                break
 
-    head, _, body = b"".join(chunks).partition(b"\r\n\r\n")
+    head, _, body = data.partition(b"\r\n\r\n")
     if not head.startswith(b"HTTP/1.0 200") and not head.startswith(b"HTTP/1.1 200"):
         raise ConnectionError(head.split(b"\r\n", 1)[0].decode(errors="replace") or "empty response")
-    return body.decode().strip()
+    text = body.decode()
+    if pattern:
+        match = pattern.search(text)
+        if not match:
+            raise ConnectionError("backend name not found in response")
+        return match.group(1)
+    return text.strip()
 
 
-def client(target, source, deadline, timeout, results, lock) -> None:
+def client(target, source, deadline, timeout, pattern, results, lock) -> None:
     while time.monotonic() < deadline:
         start = time.monotonic()
         try:
-            backend = request(target, source, timeout)
+            backend = request(target, source, timeout, pattern)
         except OSError:
             backend = None
         result = Result(start, source or "127.0.0.1", backend, time.monotonic() - start)
@@ -63,6 +82,11 @@ def report(results: list[Result], started: float, duration: float, sources: int)
     errors = len(results) - len(ok)
     backends = sorted({r.backend for r in ok})
 
+    # Pod names share a long prefix (web-5fdc855b45-); show only what differs.
+    prefix = os.path.commonprefix(backends) if len(backends) > 1 else ""
+    label = {b: b[len(prefix):] or b for b in backends}
+    width = max([8] + [len(name) + 2 for name in label.values()])
+
     print(f"\nrequests  {len(results)}  ({len(results) / duration:.0f}/s)")
     print(f"errors    {errors}")
     if ok:
@@ -79,13 +103,15 @@ def report(results: list[Result], started: float, duration: float, sources: int)
     for backend in backends:
         print(f"{backend:<9} {counts[backend]:>8}   {counts[backend] / len(results):>5.1%}")
 
-    print("\nsecond  " + "".join(f"{b:>8}" for b in backends) + "  errors")
+    if prefix:
+        print(f"\ntimeline columns drop the shared prefix {prefix!r}")
+    print("\nsecond  " + "".join(f"{label[b]:>{width}}" for b in backends) + "  errors")
     timeline: dict[int, Counter] = defaultdict(Counter)
     for r in results:
         timeline[int(r.at - started)][r.backend or "error"] += 1
     for second in range(int(duration)):
         row = timeline[second]
-        print(f"{second:>6}  " + "".join(f"{row[b]:>8}" for b in backends) + f"  {row['error']:>6}")
+        print(f"{second:>6}  " + "".join(f"{row[b]:>{width}}" for b in backends) + f"  {row['error']:>6}")
 
     if sources:
         # Distinct backends per client IP, in the order they were first used.
@@ -113,7 +139,12 @@ def main() -> None:
         default=0,
         help="spread clients over this many source IPs (127.0.0.2, 127.0.0.3, ...)",
     )
+    parser.add_argument(
+        "--backend-pattern",
+        help="regex whose first group is the backend name, e.g. 'Hostname: (\\S+)'",
+    )
     args = parser.parse_args()
+    pattern = re.compile(args.backend_pattern) if args.backend_pattern else None
 
     host, port = args.target.rsplit(":", 1)
     target = (host, int(port))
@@ -127,7 +158,7 @@ def main() -> None:
         source = f"127.0.0.{2 + i % args.sources}" if args.sources else None
         thread = threading.Thread(
             target=client,
-            args=(target, source, deadline, args.timeout, results, lock),
+            args=(target, source, deadline, args.timeout, pattern, results, lock),
             daemon=True,
         )
         thread.start()
