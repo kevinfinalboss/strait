@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Result, bail};
 use clap::ValueEnum;
+use serde::Deserialize;
 
 /// A backend server, its health and the number of connections currently proxied to it.
 #[derive(Debug)]
@@ -136,8 +137,9 @@ impl Strategy for IpHash {
     }
 }
 
-/// Strategy names accepted on the command line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+/// Strategy names accepted on the command line and in the config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Algorithm {
     RoundRobin,
     LeastConn,
@@ -162,9 +164,29 @@ pub struct Pool {
 
 impl Pool {
     pub fn new(addrs: impl IntoIterator<Item = SocketAddr>, algorithm: Algorithm) -> Result<Self> {
+        Self::rebuild(None, addrs, algorithm)
+    }
+
+    /// Builds a pool, reusing the `Backend` of every address that `previous` already had.
+    ///
+    /// On a config reload this keeps the health state and the active connection
+    /// count of backends that stay, so least-conn and health checks carry on
+    /// instead of starting from scratch.
+    pub fn rebuild(
+        previous: Option<&Pool>,
+        addrs: impl IntoIterator<Item = SocketAddr>,
+        algorithm: Algorithm,
+    ) -> Result<Self> {
+        let existing = |addr: SocketAddr| {
+            previous?
+                .backends
+                .iter()
+                .find(|backend| backend.addr == addr)
+                .cloned()
+        };
         let backends: Vec<_> = addrs
             .into_iter()
-            .map(|addr| Arc::new(Backend::new(addr)))
+            .map(|addr| existing(addr).unwrap_or_else(|| Arc::new(Backend::new(addr))))
             .collect();
 
         if backends.is_empty() {
@@ -240,6 +262,27 @@ mod tests {
         (1..=count)
             .map(|port| SocketAddr::from(([127, 0, 0, 1], port)))
             .collect()
+    }
+
+    #[test]
+    fn rebuild_keeps_state_of_backends_that_stay() {
+        let old = Pool::new(addrs(2), Algorithm::RoundRobin).unwrap();
+        let held = old.lease(CLIENT, &[old.backends()[0].addr()]).unwrap();
+        old.backends()[0].set_healthy(false);
+
+        let new_addrs = [
+            old.backends()[1].addr(),
+            SocketAddr::from(([127, 0, 0, 1], 9)),
+        ];
+        let new = Pool::rebuild(Some(&old), new_addrs, Algorithm::LeastConn).unwrap();
+
+        assert!(Arc::ptr_eq(&new.backends()[0], &old.backends()[1]));
+        assert_eq!(new.backends()[0].active_connections(), 1);
+        assert_eq!(new.backends()[1].active_connections(), 0);
+        assert!(new.backends()[1].is_healthy());
+
+        drop(held);
+        assert_eq!(new.backends()[0].active_connections(), 0);
     }
 
     #[test]
