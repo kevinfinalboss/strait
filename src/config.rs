@@ -16,6 +16,16 @@ use crate::health::HealthCheck;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listeners: Vec<ListenerConfig>,
+    /// Prometheus endpoint; off when absent.
+    #[serde(default)]
+    pub metrics: Option<MetricsConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Address that serves `/metrics` and `/healthz`.
+    pub listen: SocketAddr,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -97,6 +107,9 @@ impl Config {
 
         let mut names = HashSet::new();
         let mut addrs = HashSet::new();
+        if let Some(metrics) = self.metrics {
+            addrs.insert(metrics.listen);
+        }
         for listener in &self.listeners {
             let name = &listener.name;
             if name.is_empty() {
@@ -107,7 +120,7 @@ impl Config {
             }
             if !addrs.insert(listener.listen) {
                 bail!(
-                    "listener {name:?}: address {} is used by another listener",
+                    "listener {name:?}: address {} is used by another listener or the metrics endpoint",
                     listener.listen
                 );
             }
@@ -249,6 +262,24 @@ listeners:
 
         let text = "listeners:\n  - {name: a, listen: 127.0.0.1:1, backends: [127.0.0.1:9]}\n  - {name: b, listen: 127.0.0.1:1, backends: [127.0.0.1:9]}\n";
         assert!(error(text).contains("used by another listener"));
+    }
+
+    #[test]
+    fn parses_metrics_endpoint() {
+        let text = "metrics:\n  listen: 127.0.0.1:9090\nlisteners:\n  - {name: a, listen: 127.0.0.1:1, backends: [127.0.0.1:2]}\n";
+        let config = Config::parse(text).unwrap();
+        assert_eq!(
+            config.metrics.unwrap().listen,
+            "127.0.0.1:9090".parse().unwrap()
+        );
+
+        assert_eq!(Config::parse(FULL).unwrap().metrics, None);
+    }
+
+    #[test]
+    fn rejects_metrics_on_a_listener_address() {
+        let text = "metrics: {listen: 127.0.0.1:1}\nlisteners:\n  - {name: a, listen: 127.0.0.1:1, backends: [127.0.0.1:2]}\n";
+        assert!(error(text).contains("metrics endpoint"));
     }
 
     #[test]
