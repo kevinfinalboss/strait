@@ -13,6 +13,7 @@ use tracing::{Instrument, error, info_span};
 use crate::balancer::Pool;
 use crate::config::{Config, ListenerConfig};
 use crate::health::{self, HealthChecks};
+use crate::metrics::{BackendState, Metrics};
 use crate::{Route, serve};
 
 /// All running listeners.
@@ -21,6 +22,8 @@ use crate::{Route, serve};
 /// address updates that listener in place, even if its name changes.
 pub struct Server {
     listeners: Vec<Running>,
+    metrics: Arc<Metrics>,
+    state: BackendState,
 }
 
 struct Running {
@@ -42,11 +45,23 @@ pub struct ReloadSummary {
 
 impl Server {
     pub async fn start(config: &Config) -> Result<Self> {
+        Self::with_metrics(config, Arc::new(Metrics::default())).await
+    }
+
+    /// Like [`start`](Self::start), recording into `metrics`.
+    pub async fn with_metrics(config: &Config, metrics: Arc<Metrics>) -> Result<Self> {
         let mut server = Self {
             listeners: Vec::new(),
+            metrics,
+            state: BackendState::default(),
         };
         server.reload(config).await?;
         Ok(server)
+    }
+
+    /// Live per-backend gauges for a Prometheus registry; follows every reload.
+    pub fn backend_state(&self) -> BackendState {
+        self.state.clone()
     }
 
     /// Name and bound address of every running listener.
@@ -97,7 +112,7 @@ impl Server {
                     if running.config == *listener {
                         summary.unchanged.push(name);
                     } else {
-                        running.update(listener.clone())?;
+                        running.update(listener.clone(), &self.metrics)?;
                         summary.updated.push(name);
                     }
                     self.listeners.push(running);
@@ -109,7 +124,7 @@ impl Server {
                         .expect("every new address was bound above");
                     let (_, socket) = bound.swap_remove(index);
                     self.listeners
-                        .push(Running::start(listener.clone(), socket)?);
+                        .push(Running::start(listener.clone(), socket, &self.metrics)?);
                     summary.added.push(name);
                 }
             }
@@ -117,12 +132,18 @@ impl Server {
 
         // Dropping a listener stops its accept loop and health checks.
         summary.removed = previous.iter().map(|r| r.config.name.clone()).collect();
+        self.state.set(
+            self.listeners
+                .iter()
+                .map(|r| Arc::clone(&r.route))
+                .collect(),
+        );
         Ok(summary)
     }
 }
 
 impl Running {
-    fn start(config: ListenerConfig, socket: TcpListener) -> Result<Self> {
+    fn start(config: ListenerConfig, socket: TcpListener, metrics: &Arc<Metrics>) -> Result<Self> {
         let local_addr = socket.local_addr()?;
         let pool = Arc::new(Pool::new(config.backends.iter().copied(), config.strategy)?);
         let health = health::spawn(&pool, config.health());
@@ -130,6 +151,7 @@ impl Running {
             name: config.name.as_str().into(),
             pool,
             proxy: config.proxy(),
+            metrics: Arc::clone(metrics),
         }));
 
         let accept = tokio::spawn({
@@ -153,7 +175,7 @@ impl Running {
     }
 
     /// Swaps in a new pool and settings. Backends that stay keep their state.
-    fn update(&mut self, config: ListenerConfig) -> Result<()> {
+    fn update(&mut self, config: ListenerConfig, metrics: &Arc<Metrics>) -> Result<()> {
         let current = self.route.load();
         let pool = Arc::new(Pool::rebuild(
             Some(&current.pool),
@@ -167,6 +189,7 @@ impl Running {
             name: config.name.as_str().into(),
             pool,
             proxy: config.proxy(),
+            metrics: Arc::clone(metrics),
         }));
         self.config = config;
         Ok(())
