@@ -6,7 +6,7 @@ Everything runs on localhost. The scenarios need only Rust and Python 3 (standar
 
 ```bash
 demo/run.sh            # all scenarios
-demo/run.sh balance    # or just one: balance, least-conn, failover, affinity
+demo/run.sh balance    # or just one: balance, least-conn, failover, affinity, reload
 ```
 
 The script builds strait in release mode, starts backends `a`, `b` and `c` on ports 9101 to 9103, puts strait in front of them on `127.0.0.1:18080`, and runs [`load.py`](load.py) against it. Logs from every process go to `demo/.logs/`.
@@ -19,6 +19,7 @@ The script builds strait in release mode, starts backends `a`, `b` and `c` on po
 | `least-conn` | Backend `c` answers 50ms slower. Runs once with round-robin and once with least-conn. | With least-conn, `c` gets a small share and total requests per second go up. |
 | `failover` | Backend `b` is stopped at second 2 and started again at second 5. | `b` drops to zero in the timeline and then comes back. Only requests already in flight on `b` when it stopped fail. |
 | `affinity` | 40 client IPs with `ip-hash`. Backend `c` is stopped at second 3. | Every IP stays on one backend. When `c` stops, only the clients of `c` move. |
+| `reload` | Starts with backends `a` and `b` from a YAML config. At second 3 the file is rewritten to `b` and `c` and strait gets `SIGHUP`. | `a` stops getting new connections and `c` starts in the same second, with no errors. |
 
 ### Sample output
 
