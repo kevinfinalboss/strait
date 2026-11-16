@@ -1,26 +1,32 @@
 //! strait: a Layer 4 load balancer.
 //!
-//! Current stage: TCP load balancing across multiple backends with active
-//! health checks, connection retries, timeouts and client IP affinity.
+//! TCP load balancing across multiple backends with active health checks,
+//! connection retries, timeouts, client IP affinity and a YAML config that can
+//! be reloaded without dropping connections.
 
 mod balancer;
+mod config;
 mod health;
 mod relay;
+mod server;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::{Instrument, info, info_span, warn};
 
 pub use balancer::{
     Algorithm, Backend, IpHash, Lease, LeastConnections, Pool, RoundRobin, Strategy,
 };
-pub use health::{HealthCheck, spawn as spawn_health_checks};
+pub use config::{Config, HealthCheckConfig, ListenerConfig};
+pub use health::{HealthCheck, HealthChecks, spawn as spawn_health_checks};
 pub use relay::{Transferred, relay};
+pub use server::{ReloadSummary, Server};
 
 /// Per-connection behavior of the proxy.
 #[derive(Debug, Clone, Copy)]
@@ -43,26 +49,52 @@ impl Default for ProxyConfig {
     }
 }
 
+/// Where a listener sends its connections. Swapped atomically on a config reload.
+pub struct Route {
+    /// Listener name, attached to every connection log.
+    pub name: Arc<str>,
+    pub pool: Arc<Pool>,
+    pub proxy: ProxyConfig,
+}
+
 /// Accepts connections on `listener` forever and forwards each one to a backend from `pool`.
 ///
 /// Takes an already bound listener so callers (and tests) can bind to port 0.
 pub async fn run(listener: TcpListener, pool: Arc<Pool>, config: ProxyConfig) -> Result<()> {
+    let route = Arc::new(ArcSwap::from_pointee(Route {
+        name: "default".into(),
+        pool,
+        proxy: config,
+    }));
+    serve(listener, route).await
+}
+
+/// Like [`run`], but reads the route again for every connection, so a reload can
+/// replace it while the listener keeps running.
+pub async fn serve(listener: TcpListener, route: Arc<ArcSwap<Route>>) -> Result<()> {
     info!(
         listen = %listener.local_addr()?,
-        backends = pool.backends().len(),
-        "strait is up"
+        backends = route.load().pool.backends().len(),
+        "listening"
     );
 
     loop {
         let (client, peer) = listener.accept().await?;
-        let pool = Arc::clone(&pool);
+
+        // Each connection keeps the route that was current when it arrived, so a
+        // reload never changes the backend pool under an open connection.
+        let route = route.load_full();
 
         // One task per connection, so a slow or failing peer never blocks the accept loop.
-        tokio::spawn(async move {
-            if let Err(err) = handle(client, peer, &pool, config).await {
-                warn!(%peer, error = %err, "connection failed");
+        let span = info_span!("conn", listener = %route.name);
+        tokio::spawn(
+            async move {
+                if let Err(err) = handle(client, peer, &route.pool, route.proxy).await {
+                    warn!(%peer, error = %err, "connection failed");
+                }
             }
-        });
+            .instrument(span),
+        );
     }
 }
 

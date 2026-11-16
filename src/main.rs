@@ -1,23 +1,30 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use strait::{Algorithm, HealthCheck, Pool, ProxyConfig};
-use tokio::net::TcpListener;
+use strait::{Algorithm, Config, HealthCheckConfig, ListenerConfig, Server};
+use tokio::signal::unix::{SignalKind, signal};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// A Layer 4 load balancer written in Rust.
+///
+/// Configure it with a YAML file (--config), or with flags for a single listener.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
+    /// YAML config file; send SIGHUP to reload it without dropping connections
+    #[arg(short, long, conflicts_with = "backends")]
+    config: Option<PathBuf>,
+
     /// Address to listen on
     #[arg(short, long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
 
     /// Backend that receives connections (repeat for more backends)
-    #[arg(short = 'b', long = "backend", required = true)]
+    #[arg(short = 'b', long = "backend", required_unless_present = "config")]
     backends: Vec<SocketAddr>,
 
     /// Load balancing strategy
@@ -45,6 +52,33 @@ struct Args {
     health_timeout: Duration,
 }
 
+impl Args {
+    fn load_config(&self) -> Result<Config> {
+        if let Some(path) = &self.config {
+            return Config::load(path);
+        }
+
+        let config = Config {
+            listeners: vec![ListenerConfig {
+                name: "default".into(),
+                listen: self.listen,
+                backends: self.backends.clone(),
+                strategy: self.strategy,
+                connect_timeout: self.connect_timeout,
+                idle_timeout: self.idle_timeout,
+                retries: self.retries,
+                health_check: HealthCheckConfig {
+                    interval: self.health_interval,
+                    timeout: self.health_timeout,
+                    ..HealthCheckConfig::default()
+                },
+            }],
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -52,31 +86,31 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let pool = Arc::new(Pool::new(args.backends, args.strategy)?);
-    let listener = TcpListener::bind(args.listen).await?;
+    let mut server = Server::start(&args.load_config()?).await?;
+    for (name, addr) in server.local_addrs() {
+        info!(listener = %name, %addr, "strait is up");
+    }
 
-    strait::spawn_health_checks(
-        &pool,
-        HealthCheck {
-            interval: args.health_interval,
-            timeout: args.health_timeout,
-            ..HealthCheck::default()
-        },
-    );
-
-    let config = ProxyConfig {
-        connect_timeout: args.connect_timeout,
-        idle_timeout: args.idle_timeout,
-        retries: args.retries,
-    };
-
-    tracing::info!(strategy = ?args.strategy, "load balancing");
-
-    tokio::select! {
-        result = strait::run(listener, pool, config) => result,
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down");
-            Ok(())
+    let mut hangup = signal(SignalKind::hangup())?;
+    loop {
+        tokio::select! {
+            _ = hangup.recv() => {
+                if args.config.is_none() {
+                    warn!("SIGHUP ignored: reloading needs --config");
+                    continue;
+                }
+                match args.load_config() {
+                    Ok(config) => match server.reload(&config).await {
+                        Ok(summary) => info!(%summary, "config reloaded"),
+                        Err(err) => error!(error = format!("{err:#}"), "reload failed, keeping previous config"),
+                    },
+                    Err(err) => error!(error = format!("{err:#}"), "reload failed, keeping previous config"),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("shutting down");
+                return Ok(());
+            }
         }
     }
 }
