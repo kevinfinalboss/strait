@@ -2,25 +2,43 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Result, bail};
 use clap::ValueEnum;
 
-/// A backend server and the number of connections currently proxied to it.
+/// A backend server, its health and the number of connections currently proxied to it.
 #[derive(Debug)]
 pub struct Backend {
     addr: SocketAddr,
     active: AtomicUsize,
+    healthy: AtomicBool,
 }
 
 impl Backend {
+    fn new(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            active: AtomicUsize::new(0),
+            healthy: AtomicBool::new(true),
+        }
+    }
+
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
     pub fn active_connections(&self) -> usize {
         self.active.load(Ordering::Relaxed)
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Relaxed)
+    }
+
+    /// Updates the health flag and returns the previous value.
+    pub fn set_healthy(&self, healthy: bool) -> bool {
+        self.healthy.swap(healthy, Ordering::Relaxed)
     }
 }
 
@@ -111,12 +129,7 @@ impl Pool {
     pub fn new(addrs: impl IntoIterator<Item = SocketAddr>, algorithm: Algorithm) -> Result<Self> {
         let backends: Vec<_> = addrs
             .into_iter()
-            .map(|addr| {
-                Arc::new(Backend {
-                    addr,
-                    active: AtomicUsize::new(0),
-                })
-            })
+            .map(|addr| Arc::new(Backend::new(addr)))
             .collect();
 
         if backends.is_empty() {
@@ -130,9 +143,36 @@ impl Pool {
     }
 
     /// Chooses a backend for a new connection and marks it as active.
-    pub fn lease(&self) -> Lease {
-        let index = self.strategy.choose(&self.backends);
-        Lease::new(Arc::clone(&self.backends[index]))
+    ///
+    /// Backends in `exclude` are skipped, so a retry never hits the same backend twice.
+    /// Only healthy backends are considered; if none is healthy, every remaining
+    /// backend is tried instead (fail open), since health checks can be wrong.
+    /// Returns `None` when every backend is excluded.
+    pub fn lease(&self, exclude: &[SocketAddr]) -> Option<Lease> {
+        let remaining: Vec<_> = self
+            .backends
+            .iter()
+            .filter(|backend| !exclude.contains(&backend.addr))
+            .cloned()
+            .collect();
+
+        let healthy: Vec<_> = remaining
+            .iter()
+            .filter(|backend| backend.is_healthy())
+            .cloned()
+            .collect();
+
+        let candidates = if healthy.is_empty() {
+            remaining
+        } else {
+            healthy
+        };
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let index = self.strategy.choose(&candidates);
+        Some(Lease::new(Arc::clone(&candidates[index])))
     }
 
     pub fn backends(&self) -> &[Arc<Backend>] {
@@ -143,6 +183,10 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lease(pool: &Pool) -> Lease {
+        pool.lease(&[]).unwrap()
+    }
 
     fn addrs(count: u16) -> Vec<SocketAddr> {
         (1..=count)
@@ -159,7 +203,7 @@ mod tests {
     fn round_robin_cycles_through_backends() {
         let pool = Pool::new(addrs(3), Algorithm::RoundRobin).unwrap();
 
-        let ports: Vec<u16> = (0..6).map(|_| pool.lease().addr().port()).collect();
+        let ports: Vec<u16> = (0..6).map(|_| lease(&pool).addr().port()).collect();
 
         assert_eq!(ports, [1, 2, 3, 1, 2, 3]);
     }
@@ -168,13 +212,13 @@ mod tests {
     fn least_connections_prefers_idle_backend() {
         let pool = Pool::new(addrs(3), Algorithm::LeastConn).unwrap();
 
-        let first = pool.lease();
-        let second = pool.lease();
+        let first = lease(&pool);
+        let second = lease(&pool);
         assert_eq!(first.addr().port(), 1);
         assert_eq!(second.addr().port(), 2);
 
         drop(first);
-        assert_eq!(pool.lease().addr().port(), 1);
+        assert_eq!(lease(&pool).addr().port(), 1);
     }
 
     #[test]
@@ -182,10 +226,40 @@ mod tests {
         let pool = Pool::new(addrs(1), Algorithm::RoundRobin).unwrap();
         let backend = &pool.backends()[0];
 
-        let lease = pool.lease();
+        let leased = lease(&pool);
         assert_eq!(backend.active_connections(), 1);
 
-        drop(lease);
+        drop(leased);
         assert_eq!(backend.active_connections(), 0);
+    }
+
+    #[test]
+    fn skips_unhealthy_backends() {
+        let pool = Pool::new(addrs(3), Algorithm::RoundRobin).unwrap();
+        pool.backends()[1].set_healthy(false);
+
+        let ports: Vec<u16> = (0..4).map(|_| lease(&pool).addr().port()).collect();
+
+        assert_eq!(ports, [1, 3, 1, 3]);
+    }
+
+    #[test]
+    fn fails_open_when_no_backend_is_healthy() {
+        let pool = Pool::new(addrs(2), Algorithm::RoundRobin).unwrap();
+        for backend in pool.backends() {
+            backend.set_healthy(false);
+        }
+
+        assert!(pool.lease(&[]).is_some());
+    }
+
+    #[test]
+    fn excludes_already_tried_backends() {
+        let pool = Pool::new(addrs(2), Algorithm::RoundRobin).unwrap();
+        let first = pool.backends()[0].addr();
+        let second = pool.backends()[1].addr();
+
+        assert_eq!(pool.lease(&[first]).unwrap().addr(), second);
+        assert!(pool.lease(&[first, second]).is_none());
     }
 }
