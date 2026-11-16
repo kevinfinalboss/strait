@@ -1,23 +1,50 @@
 //! strait: a Layer 4 load balancer.
 //!
-//! Current stage: TCP load balancing across multiple backends with
-//! round-robin or least-connections.
+//! Current stage: TCP load balancing across multiple backends with active
+//! health checks, connection retries and timeouts.
 
 mod balancer;
+mod health;
+mod relay;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
-use tokio::io::copy_bidirectional;
+use anyhow::{Context, Result, bail};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 pub use balancer::{Algorithm, Backend, Lease, Pool, Strategy};
+pub use health::{HealthCheck, spawn as spawn_health_checks};
+pub use relay::{Transferred, relay};
+
+/// Per-connection behavior of the proxy.
+#[derive(Debug, Clone, Copy)]
+pub struct ProxyConfig {
+    /// Maximum time to establish a connection to a backend.
+    pub connect_timeout: Duration,
+    /// Close a connection when no byte moves in either direction for this long.
+    pub idle_timeout: Duration,
+    /// Extra backends to try when connecting to the chosen one fails.
+    pub retries: usize,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(3),
+            idle_timeout: Duration::from_secs(300),
+            retries: 2,
+        }
+    }
+}
 
 /// Accepts connections on `listener` forever and forwards each one to a backend from `pool`.
 ///
 /// Takes an already bound listener so callers (and tests) can bind to port 0.
-pub async fn run(listener: TcpListener, pool: Arc<Pool>) -> Result<()> {
+pub async fn run(listener: TcpListener, pool: Arc<Pool>, config: ProxyConfig) -> Result<()> {
     info!(
         listen = %listener.local_addr()?,
         backends = pool.backends().len(),
@@ -26,32 +53,57 @@ pub async fn run(listener: TcpListener, pool: Arc<Pool>) -> Result<()> {
 
     loop {
         let (client, peer) = listener.accept().await?;
-        let lease = pool.lease();
+        let pool = Arc::clone(&pool);
 
         // One task per connection, so a slow or failing peer never blocks the accept loop.
         tokio::spawn(async move {
-            let backend = lease.addr();
-            if let Err(err) = handle(client, lease).await {
-                warn!(%peer, %backend, error = %err, "connection failed");
+            if let Err(err) = handle(client, &pool, config).await {
+                warn!(%peer, error = %err, "connection failed");
             }
         });
     }
 }
 
-/// Connects `client` to the leased backend and relays bytes in both directions
-/// until either side closes. The lease is released when this function returns.
-async fn handle(mut client: TcpStream, lease: Lease) -> Result<()> {
+/// Connects `client` to a backend, retrying on others if needed, then relays bytes
+/// until both sides close. The lease is released when this function returns.
+async fn handle(mut client: TcpStream, pool: &Pool, config: ProxyConfig) -> Result<()> {
     let peer = client.peer_addr()?;
+    let (lease, mut upstream) = connect(pool, config).await?;
     let backend = lease.addr();
-
-    let mut upstream = TcpStream::connect(backend)
-        .await
-        .with_context(|| format!("could not connect to backend {backend}"))?;
 
     info!(%peer, %backend, "connection opened");
 
-    let (sent, received) = copy_bidirectional(&mut client, &mut upstream).await?;
+    let transferred = relay(&mut client, &mut upstream, config.idle_timeout)
+        .await
+        .with_context(|| format!("relay to {backend} stopped"))?;
 
-    info!(%peer, %backend, sent, received, "connection closed");
+    info!(
+        %peer,
+        %backend,
+        sent = transferred.sent,
+        received = transferred.received,
+        "connection closed"
+    );
     Ok(())
+}
+
+/// Tries up to `1 + retries` different backends and returns the first that accepts.
+async fn connect(pool: &Pool, config: ProxyConfig) -> Result<(Lease, TcpStream)> {
+    let mut tried: Vec<SocketAddr> = Vec::new();
+
+    for _ in 0..=config.retries {
+        let Some(lease) = pool.lease(&tried) else {
+            break;
+        };
+        let backend = lease.addr();
+
+        match timeout(config.connect_timeout, TcpStream::connect(backend)).await {
+            Ok(Ok(upstream)) => return Ok((lease, upstream)),
+            Ok(Err(err)) => warn!(%backend, error = %err, "backend refused connection"),
+            Err(_) => warn!(%backend, "backend connect timed out"),
+        }
+        tried.push(backend);
+    }
+
+    bail!("no backend accepted the connection (tried {})", tried.len())
 }
