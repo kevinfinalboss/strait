@@ -93,7 +93,7 @@ async fn health_checks_remove_and_restore_a_backend() {
     drop(listener);
 
     let pool = Arc::new(Pool::new([addr], Algorithm::RoundRobin).unwrap());
-    strait::spawn_health_checks(&pool, fast_health_checks());
+    let _checks = strait::spawn_health_checks(&pool, fast_health_checks());
     let backend = Arc::clone(&pool.backends()[0]);
 
     eventually(|| !backend.is_healthy()).await;
@@ -107,7 +107,7 @@ async fn health_checks_remove_and_restore_a_backend() {
 async fn unhealthy_backend_gets_no_traffic() {
     let backends = [dead_addr().await, spawn_named_backend("b").await];
     let pool = Arc::new(Pool::new(backends, Algorithm::RoundRobin).unwrap());
-    strait::spawn_health_checks(&pool, fast_health_checks());
+    let _checks = strait::spawn_health_checks(&pool, fast_health_checks());
 
     let dead = Arc::clone(&pool.backends()[0]);
     eventually(|| !dead.is_healthy()).await;
