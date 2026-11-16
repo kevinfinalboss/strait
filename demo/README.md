@@ -2,7 +2,7 @@
 
 Scenarios that run strait in front of three local HTTP backends and drive traffic through it, to show how it behaves under load and when things fail.
 
-Everything runs on localhost and needs only Rust and Python 3 (standard library only).
+Everything runs on localhost. The scenarios need only Rust and Python 3 (standard library only); the benchmark also needs oha and jq.
 
 ```bash
 demo/run.sh            # all scenarios
@@ -40,6 +40,28 @@ second         a       b       c  errors
 ```
 
 The 2 errors are the requests that were in flight on `b` when it was stopped. An L4 load balancer cannot replay a connection that already exchanged bytes. Every new connection that was routed to `b` after that was retried on `a` or `c` until the health check took `b` out of rotation.
+
+## Benchmark
+
+```bash
+cargo install oha   # once; also needs jq
+demo/bench.sh       # CONNECTIONS=100 DURATION=30s demo/bench.sh to tune
+```
+
+Measures strait against a minimal Rust HTTP backend ([`examples/bench_backend.rs`](../examples/bench_backend.rs)) that is never the bottleneck. Each run hits the backend directly and then through strait, with keep-alive and with a new connection per request:
+
+| Run | Requests/s | p50 | p99 | CPU/request |
+|---|---|---|---|---|
+| keep-alive, direct | 145,130 | 0.27 ms | 1.41 ms | 30.2 µs |
+| keep-alive, via strait | 80,281 | 0.53 ms | 1.98 ms | 49.8 µs |
+| new connection per request, direct | 50,300 | 0.83 ms | 2.99 ms | 75.5 µs |
+| new connection per request, via strait | 20,124 | 2.29 ms | 5.72 ms | 272.4 µs |
+
+CPU/request is the backend's own CPU time on direct runs and strait's on runs through strait. It varies less than requests per second when other processes compete for the CPU.
+
+Raw oha output is saved to `demo/.logs/bench/`.
+
+Running many short connections fills the ephemeral port range with sockets in `TIME_WAIT`. If numbers look off, check `ss -tan state time-wait | wc -l` and wait a minute before running again.
 
 ## Tools
 
