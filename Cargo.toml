@@ -1,0 +1,15 @@
+[package]
+name = "strait"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A Layer 4 load balancer written in Rust"
+license = "MIT"
+repository = "https://github.com/kevinfinalboss/strait"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
