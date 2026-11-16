@@ -1,0 +1,26 @@
+# Example strait config. Run with: strait --config strait.example.yaml
+# Reload after editing with: kill -HUP <pid>
+
+listeners:
+  # Every field except name, listen and backends is optional; defaults are shown.
+  - name: web
+    listen: 127.0.0.1:8080
+    backends:
+      - 127.0.0.1:9001
+      - 127.0.0.1:9002
+    strategy: round-robin # round-robin | least-conn | ip-hash
+    connect_timeout: 3s
+    idle_timeout: 5m
+    retries: 2
+    health_check:
+      interval: 5s
+      timeout: 1s
+      unhealthy_threshold: 2
+      healthy_threshold: 2
+
+  # A second listener with its own backends, using the defaults.
+  - name: cache
+    listen: 127.0.0.1:6380
+    strategy: ip-hash
+    backends:
+      - 127.0.0.1:6379
