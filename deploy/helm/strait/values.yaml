@@ -1,0 +1,78 @@
+image:
+  repository: ghcr.io/kevinfinalboss/strait
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+replicaCount: 1
+nameOverride: ""
+fullnameOverride: ""
+
+# strait config file, rendered into a ConfigMap. Same format as strait.example.yaml.
+# Each listener becomes a port on the Service, named after the listener.
+config:
+  metrics:
+    listen: 0.0.0.0:9090
+  listeners:
+    - name: web
+      listen: 0.0.0.0:8080
+      strategy: round-robin
+      kubernetes:
+        # Ready pods of this Service become backends.
+        service: web
+        # Port name from the Service, or the container port number.
+        port: http
+
+# Apply ConfigMap changes without restarting the pods. When false, a config
+# change rolls the Deployment instead.
+watchConfig: true
+
+serviceAccount:
+  create: true
+  # Defaults to the release fullname.
+  name: ""
+  annotations: {}
+
+rbac:
+  # Role that lets strait read EndpointSlices.
+  create: true
+  # Use a ClusterRole so listeners can watch Services in other namespaces.
+  clusterWide: false
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Prometheus Operator ServiceMonitor for the metrics endpoint.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}

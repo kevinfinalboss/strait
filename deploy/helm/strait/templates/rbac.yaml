@@ -1,0 +1,29 @@
+{{- if .Values.rbac.create }}
+{{- $kind := ternary "ClusterRole" "Role" .Values.rbac.clusterWide }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ $kind }}
+metadata:
+  name: {{ include "strait.fullname" . }}
+  labels:
+    {{- include "strait.labels" . | nindent 4 }}
+rules:
+  # Read-only access to the EndpointSlices that list a Service's ready pods.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ $kind }}Binding
+metadata:
+  name: {{ include "strait.fullname" . }}
+  labels:
+    {{- include "strait.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: {{ $kind }}
+  name: {{ include "strait.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "strait.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

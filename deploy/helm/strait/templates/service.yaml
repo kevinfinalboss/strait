@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "strait.fullname" . }}
+  labels:
+    {{- include "strait.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "strait.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- range .Values.config.listeners }}
+    - name: {{ include "strait.portName" .name }}
+      port: {{ include "strait.port" .listen }}
+      targetPort: {{ include "strait.portName" .name }}
+      protocol: TCP
+    {{- end }}
+    {{- with .Values.config.metrics }}
+    - name: metrics
+      port: {{ include "strait.port" .listen }}
+      targetPort: metrics
+      protocol: TCP
+    {{- end }}

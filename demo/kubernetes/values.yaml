@@ -1,0 +1,19 @@
+# Values for running the chart on a local kind cluster with an image loaded by
+# `kind load docker-image strait:dev`.
+image:
+  repository: strait
+  tag: dev
+  pullPolicy: Never
+
+config:
+  metrics:
+    listen: 0.0.0.0:9090
+  listeners:
+    - name: web
+      listen: 0.0.0.0:8080
+      strategy: round-robin
+      health_check:
+        interval: 1s
+      kubernetes:
+        service: web
+        port: http

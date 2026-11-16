@@ -1,0 +1,20 @@
+strait is running as {{ include "strait.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+Listeners on Service {{ include "strait.fullname" . }}:
+{{- range .Values.config.listeners }}
+  - {{ .name }}: port {{ include "strait.port" .listen }}
+    {{- with .kubernetes }} -> ready pods of Service {{ .service }}{{ with .namespace }} in {{ . }}{{ end }}{{ end }}
+{{- end }}
+
+Try it:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "strait.fullname" . }} {{ include "strait.port" (first .Values.config.listeners).listen }}
+{{- if .Values.config.metrics }}
+
+Metrics:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "strait.fullname" . }} {{ include "strait.port" .Values.config.metrics.listen }}
+  curl localhost:{{ include "strait.port" .Values.config.metrics.listen }}/metrics
+{{- end }}
+{{- if .Values.watchConfig }}
+
+Config changes (helm upgrade) apply without restarting the pods, usually within a minute.
+{{- end }}

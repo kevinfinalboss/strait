@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "strait.fullname" . }}
+  labels:
+    {{- include "strait.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "strait.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- if not .Values.watchConfig }}
+        # Without watchConfig, a config change has to roll the pods to apply.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "strait.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "strait.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: strait
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config
+            - /etc/strait/strait.yaml
+            {{- if .Values.watchConfig }}
+            - --watch-config
+            {{- end }}
+          ports:
+            {{- range .Values.config.listeners }}
+            - name: {{ include "strait.portName" .name }}
+              containerPort: {{ include "strait.port" .listen }}
+              protocol: TCP
+            {{- end }}
+            {{- with .Values.config.metrics }}
+            - name: metrics
+              containerPort: {{ include "strait.port" .listen }}
+              protocol: TCP
+            {{- end }}
+          {{- if .Values.config.metrics }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          {{- else }}
+          livenessProbe:
+            tcpSocket:
+              port: {{ include "strait.portName" (first .Values.config.listeners).name }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # Mounted as a directory, not with subPath: subPath mounts never see
+            # ConfigMap updates, which watchConfig relies on.
+            - name: config
+              mountPath: /etc/strait
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "strait.fullname" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

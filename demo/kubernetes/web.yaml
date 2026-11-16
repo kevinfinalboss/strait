@@ -1,0 +1,52 @@
+# Demo backend: each pod answers with its own name, so you can see which
+# replica strait picked.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.12.0
+          args: ["--port", "8080"]
+          ports:
+            - name: http
+              containerPort: 8080
+          # Keep serving for a few seconds after the pod starts terminating, so
+          # load balancers (strait included) drop it from rotation before it stops.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

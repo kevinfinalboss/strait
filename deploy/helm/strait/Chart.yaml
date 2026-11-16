@@ -1,0 +1,14 @@
+apiVersion: v2
+name: strait
+description: A Layer 4 load balancer written in Rust, with Kubernetes service discovery
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/kevinfinalboss/strait
+sources:
+  - https://github.com/kevinfinalboss/strait
+keywords:
+  - load-balancer
+  - tcp
+  - layer4
+  - rust

@@ -1,0 +1,10 @@
+{{- include "strait.checkNamespaces" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "strait.fullname" . }}
+  labels:
+    {{- include "strait.labels" . | nindent 4 }}
+data:
+  strait.yaml: |
+    {{- toYaml .Values.config | nindent 4 }}
