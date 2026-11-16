@@ -1,7 +1,7 @@
 //! strait: a Layer 4 load balancer.
 //!
 //! Current stage: TCP load balancing across multiple backends with active
-//! health checks, connection retries and timeouts.
+//! health checks, connection retries, timeouts and client IP affinity.
 
 mod balancer;
 mod health;
@@ -16,7 +16,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
-pub use balancer::{Algorithm, Backend, Lease, Pool, Strategy};
+pub use balancer::{
+    Algorithm, Backend, IpHash, Lease, LeastConnections, Pool, RoundRobin, Strategy,
+};
 pub use health::{HealthCheck, spawn as spawn_health_checks};
 pub use relay::{Transferred, relay};
 
@@ -57,7 +59,7 @@ pub async fn run(listener: TcpListener, pool: Arc<Pool>, config: ProxyConfig) ->
 
         // One task per connection, so a slow or failing peer never blocks the accept loop.
         tokio::spawn(async move {
-            if let Err(err) = handle(client, &pool, config).await {
+            if let Err(err) = handle(client, peer, &pool, config).await {
                 warn!(%peer, error = %err, "connection failed");
             }
         });
@@ -66,9 +68,13 @@ pub async fn run(listener: TcpListener, pool: Arc<Pool>, config: ProxyConfig) ->
 
 /// Connects `client` to a backend, retrying on others if needed, then relays bytes
 /// until both sides close. The lease is released when this function returns.
-async fn handle(mut client: TcpStream, pool: &Pool, config: ProxyConfig) -> Result<()> {
-    let peer = client.peer_addr()?;
-    let (lease, mut upstream) = connect(pool, config).await?;
+async fn handle(
+    mut client: TcpStream,
+    peer: SocketAddr,
+    pool: &Pool,
+    config: ProxyConfig,
+) -> Result<()> {
+    let (lease, mut upstream) = connect(pool, peer, config).await?;
     let backend = lease.addr();
 
     info!(%peer, %backend, "connection opened");
@@ -88,11 +94,15 @@ async fn handle(mut client: TcpStream, pool: &Pool, config: ProxyConfig) -> Resu
 }
 
 /// Tries up to `1 + retries` different backends and returns the first that accepts.
-async fn connect(pool: &Pool, config: ProxyConfig) -> Result<(Lease, TcpStream)> {
+async fn connect(
+    pool: &Pool,
+    client: SocketAddr,
+    config: ProxyConfig,
+) -> Result<(Lease, TcpStream)> {
     let mut tried: Vec<SocketAddr> = Vec::new();
 
     for _ in 0..=config.retries {
-        let Some(lease) = pool.lease(&tried) else {
+        let Some(lease) = pool.lease(client, &tried) else {
             break;
         };
         let backend = lease.addr();

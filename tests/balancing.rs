@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use strait::{Algorithm, Pool, ProxyConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 /// Starts a backend that sends `name` to every client and then holds the connection open.
 async fn spawn_named_backend(name: &'static str) -> SocketAddr {
@@ -80,4 +80,36 @@ async fn least_connections_skips_busy_backends() {
     let (_third, c) = connect(proxy).await;
 
     assert_eq!([a, b, c], ["a", "b", "c"]);
+}
+
+/// Connects through the proxy from `source` (any 127.x.y.z address works on Linux loopback).
+async fn connect_from(source: [u8; 4], proxy: SocketAddr) -> String {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind(SocketAddr::from((source, 0))).unwrap();
+    let mut stream = socket.connect(proxy).await.unwrap();
+    let mut name = [0u8; 1];
+    stream.read_exact(&mut name).await.unwrap();
+    String::from_utf8(name.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn ip_hash_pins_each_client_to_one_backend() {
+    let backends = vec![
+        spawn_named_backend("a").await,
+        spawn_named_backend("b").await,
+        spawn_named_backend("c").await,
+    ];
+    let proxy = spawn_strait(backends, Algorithm::IpHash).await;
+
+    let mut used = std::collections::HashSet::new();
+    for host in 2..22u8 {
+        let first = connect_from([127, 0, 0, host], proxy).await;
+        for _ in 0..3 {
+            assert_eq!(connect_from([127, 0, 0, host], proxy).await, first);
+        }
+        used.insert(first);
+    }
+
+    // 20 different clients should not all land on the same backend.
+    assert!(used.len() > 1, "every client went to {used:?}");
 }

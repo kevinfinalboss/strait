@@ -1,6 +1,7 @@
 //! Backend pool and load balancing strategies.
 
-use std::net::SocketAddr;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -72,8 +73,9 @@ impl Drop for Lease {
 ///
 /// `Send + Sync` is required because one strategy is shared by every connection task.
 pub trait Strategy: Send + Sync {
-    /// Returns the index of the chosen backend. `backends` is never empty.
-    fn choose(&self, backends: &[Arc<Backend>]) -> usize;
+    /// Returns the index of the chosen backend for a connection from `client`.
+    /// `backends` is never empty.
+    fn choose(&self, backends: &[Arc<Backend>], client: SocketAddr) -> usize;
 }
 
 /// Cycles through the backends in order.
@@ -83,7 +85,7 @@ pub struct RoundRobin {
 }
 
 impl Strategy for RoundRobin {
-    fn choose(&self, backends: &[Arc<Backend>]) -> usize {
+    fn choose(&self, backends: &[Arc<Backend>], _client: SocketAddr) -> usize {
         self.next.fetch_add(1, Ordering::Relaxed) % backends.len()
     }
 }
@@ -93,11 +95,42 @@ impl Strategy for RoundRobin {
 pub struct LeastConnections;
 
 impl Strategy for LeastConnections {
-    fn choose(&self, backends: &[Arc<Backend>]) -> usize {
+    fn choose(&self, backends: &[Arc<Backend>], _client: SocketAddr) -> usize {
         backends
             .iter()
             .enumerate()
             .min_by_key(|(_, backend)| backend.active_connections())
+            .map(|(index, _)| index)
+            .expect("backends is never empty")
+    }
+}
+
+/// Keeps every connection from the same client IP on the same backend.
+///
+/// Uses rendezvous (highest random weight) hashing: each backend gets a score
+/// from `hash(client ip, backend addr)` and the highest score wins. When a
+/// backend leaves the candidate list, only the clients it was winning move;
+/// everyone else keeps their backend.
+///
+/// The client port is ignored, so reconnects from the same host stick.
+#[derive(Debug, Default)]
+pub struct IpHash;
+
+impl IpHash {
+    fn score(client: IpAddr, backend: SocketAddr) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        client.hash(&mut hasher);
+        backend.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+impl Strategy for IpHash {
+    fn choose(&self, backends: &[Arc<Backend>], client: SocketAddr) -> usize {
+        backends
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, backend)| Self::score(client.ip(), backend.addr()))
             .map(|(index, _)| index)
             .expect("backends is never empty")
     }
@@ -108,6 +141,7 @@ impl Strategy for LeastConnections {
 pub enum Algorithm {
     RoundRobin,
     LeastConn,
+    IpHash,
 }
 
 impl Algorithm {
@@ -115,6 +149,7 @@ impl Algorithm {
         match self {
             Algorithm::RoundRobin => Box::new(RoundRobin::default()),
             Algorithm::LeastConn => Box::new(LeastConnections),
+            Algorithm::IpHash => Box::new(IpHash),
         }
     }
 }
@@ -142,13 +177,13 @@ impl Pool {
         })
     }
 
-    /// Chooses a backend for a new connection and marks it as active.
+    /// Chooses a backend for a new connection from `client` and marks it as active.
     ///
     /// Backends in `exclude` are skipped, so a retry never hits the same backend twice.
     /// Only healthy backends are considered; if none is healthy, every remaining
     /// backend is tried instead (fail open), since health checks can be wrong.
     /// Returns `None` when every backend is excluded.
-    pub fn lease(&self, exclude: &[SocketAddr]) -> Option<Lease> {
+    pub fn lease(&self, client: SocketAddr, exclude: &[SocketAddr]) -> Option<Lease> {
         let remaining: Vec<_> = self
             .backends
             .iter()
@@ -171,7 +206,7 @@ impl Pool {
             return None;
         }
 
-        let index = self.strategy.choose(&candidates);
+        let index = self.strategy.choose(&candidates, client);
         Some(Lease::new(Arc::clone(&candidates[index])))
     }
 
@@ -184,8 +219,21 @@ impl Pool {
 mod tests {
     use super::*;
 
+    const CLIENT: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 50000);
+
     fn lease(pool: &Pool) -> Lease {
-        pool.lease(&[]).unwrap()
+        pool.lease(CLIENT, &[]).unwrap()
+    }
+
+    fn client(index: u32) -> SocketAddr {
+        SocketAddr::from((std::net::Ipv4Addr::from(0x0a00_0000 + index), 40000))
+    }
+
+    /// Returns the backend port each of `clients` is sent to.
+    fn assignments(pool: &Pool, clients: u32) -> Vec<u16> {
+        (0..clients)
+            .map(|i| pool.lease(client(i), &[]).unwrap().addr().port())
+            .collect()
     }
 
     fn addrs(count: u16) -> Vec<SocketAddr> {
@@ -250,7 +298,7 @@ mod tests {
             backend.set_healthy(false);
         }
 
-        assert!(pool.lease(&[]).is_some());
+        assert!(pool.lease(CLIENT, &[]).is_some());
     }
 
     #[test]
@@ -259,7 +307,51 @@ mod tests {
         let first = pool.backends()[0].addr();
         let second = pool.backends()[1].addr();
 
-        assert_eq!(pool.lease(&[first]).unwrap().addr(), second);
-        assert!(pool.lease(&[first, second]).is_none());
+        assert_eq!(pool.lease(CLIENT, &[first]).unwrap().addr(), second);
+        assert!(pool.lease(CLIENT, &[first, second]).is_none());
+    }
+
+    #[test]
+    fn ip_hash_keeps_a_client_on_one_backend() {
+        let pool = Pool::new(addrs(4), Algorithm::IpHash).unwrap();
+        let host = client(7);
+
+        let first = pool.lease(host, &[]).unwrap().addr();
+        for port in [40001, 40002, 51234] {
+            let reconnect = SocketAddr::new(host.ip(), port);
+            assert_eq!(pool.lease(reconnect, &[]).unwrap().addr(), first);
+        }
+    }
+
+    #[test]
+    fn ip_hash_spreads_clients_across_backends() {
+        let pool = Pool::new(addrs(4), Algorithm::IpHash).unwrap();
+
+        let ports = assignments(&pool, 4000);
+
+        for backend in 1..=4 {
+            let share = ports.iter().filter(|&&port| port == backend).count();
+            assert!(
+                (800..=1200).contains(&share),
+                "backend {backend} got {share}"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_hash_only_moves_clients_of_a_removed_backend() {
+        let pool = Pool::new(addrs(4), Algorithm::IpHash).unwrap();
+        let before = assignments(&pool, 4000);
+
+        pool.backends()[2].set_healthy(false);
+        let after = assignments(&pool, 4000);
+
+        for (old, new) in before.iter().zip(&after) {
+            if *old == 3 {
+                assert_ne!(*new, 3);
+            } else {
+                assert_eq!(old, new);
+            }
+        }
     }
 }
