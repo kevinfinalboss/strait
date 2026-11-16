@@ -95,3 +95,54 @@ async fn survives_unreachable_backend() {
         assert!(buf.is_empty());
     }
 }
+
+/// Starts a keep-alive backend that answers every request with its headers and
+/// body in two separate writes, like many real HTTP servers do.
+async fn spawn_split_write_backend() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            tokio::spawn(async move {
+                let mut request = [0u8; 1];
+                while socket.read_exact(&mut request).await.is_ok() {
+                    socket.write_all(b"head").await.unwrap();
+                    // A short gap so strait reads the two writes separately.
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    socket.write_all(b"body").await.unwrap();
+                }
+            });
+        }
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn does_not_delay_responses_split_over_several_writes() {
+    let backend = spawn_split_write_backend().await;
+    let proxy = spawn_strait(backend).await;
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+
+    // Without TCP_NODELAY, Nagle holds back "body" until "head" is acknowledged,
+    // and the client's delayed ACK turns that into stalls of about 40ms.
+    let mut stalled = 0;
+    for _ in 0..200 {
+        let started = std::time::Instant::now();
+        client.write_all(b"?").await.unwrap();
+        let mut response = [0u8; 8];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"headbody");
+        if started.elapsed() > std::time::Duration::from_millis(30) {
+            stalled += 1;
+        }
+    }
+
+    assert_eq!(
+        stalled, 0,
+        "{stalled} of 200 responses stalled for over 30ms"
+    );
+}
