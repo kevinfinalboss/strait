@@ -1,10 +1,16 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use strait::{Algorithm, Config, HealthCheckConfig, ListenerConfig, Server};
+use prometheus_client::registry::Registry;
+use strait::{
+    Algorithm, Config, HealthCheckConfig, ListenerConfig, Metrics, MetricsConfig, ReloadResult,
+    Server,
+};
+use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -50,10 +56,23 @@ struct Args {
     /// Maximum time a health check may take
     #[arg(long, default_value = "1s", value_parser = humantime::parse_duration)]
     health_timeout: Duration,
+
+    /// Serve Prometheus metrics on this address (overrides `metrics.listen` in the config)
+    #[arg(long, value_name = "ADDR")]
+    metrics: Option<SocketAddr>,
 }
 
 impl Args {
     fn load_config(&self) -> Result<Config> {
+        let mut config = self.config_without_overrides()?;
+        if let Some(listen) = self.metrics {
+            config.metrics = Some(MetricsConfig { listen });
+            config.validate()?;
+        }
+        Ok(config)
+    }
+
+    fn config_without_overrides(&self) -> Result<Config> {
         if let Some(path) = &self.config {
             return Config::load(path);
         }
@@ -73,6 +92,7 @@ impl Args {
                     ..HealthCheckConfig::default()
                 },
             }],
+            metrics: None,
         };
         config.validate()?;
         Ok(config)
@@ -86,9 +106,27 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let mut server = Server::start(&args.load_config()?).await?;
+    let config = args.load_config()?;
+    let metrics = Arc::new(Metrics::default());
+    let mut server = Server::with_metrics(&config, Arc::clone(&metrics)).await?;
     for (name, addr) in server.local_addrs() {
         info!(listener = %name, %addr, "strait is up");
+    }
+
+    // The metrics address is read once at startup; changing it needs a restart.
+    let metrics_listen = config.metrics.map(|m| m.listen);
+    if let Some(listen) = metrics_listen {
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        registry.register_collector(Box::new(server.backend_state()));
+        let socket = TcpListener::bind(listen)
+            .await
+            .with_context(|| format!("could not bind metrics endpoint {listen}"))?;
+        tokio::spawn(async move {
+            if let Err(err) = strait::serve_metrics(socket, Arc::new(registry)).await {
+                error!(error = %err, "metrics endpoint stopped");
+            }
+        });
     }
 
     let mut hangup = signal(SignalKind::hangup())?;
@@ -99,12 +137,24 @@ async fn main() -> Result<()> {
                     warn!("SIGHUP ignored: reloading needs --config");
                     continue;
                 }
-                match args.load_config() {
-                    Ok(config) => match server.reload(&config).await {
-                        Ok(summary) => info!(%summary, "config reloaded"),
-                        Err(err) => error!(error = format!("{err:#}"), "reload failed, keeping previous config"),
-                    },
-                    Err(err) => error!(error = format!("{err:#}"), "reload failed, keeping previous config"),
+                let reloaded = match args.load_config() {
+                    Ok(config) => {
+                        if config.metrics.map(|m| m.listen) != metrics_listen {
+                            warn!("metrics.listen changed; restart strait to apply it");
+                        }
+                        server.reload(&config).await
+                    }
+                    Err(err) => Err(err),
+                };
+                match reloaded {
+                    Ok(summary) => {
+                        metrics.record_reload(ReloadResult::Success);
+                        info!(%summary, "config reloaded");
+                    }
+                    Err(err) => {
+                        metrics.record_reload(ReloadResult::Failure);
+                        error!(error = format!("{err:#}"), "reload failed, keeping previous config");
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
