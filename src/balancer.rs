@@ -15,6 +15,9 @@ pub struct Backend {
     addr: SocketAddr,
     active: AtomicUsize,
     healthy: AtomicBool,
+    /// Set when a rebuild of its pool leaves it out: it is no longer a backend
+    /// of the listener, though open connections may still use it.
+    retired: AtomicBool,
 }
 
 impl Backend {
@@ -23,6 +26,7 @@ impl Backend {
             addr,
             active: AtomicUsize::new(0),
             healthy: AtomicBool::new(true),
+            retired: AtomicBool::new(false),
         }
     }
 
@@ -36,6 +40,11 @@ impl Backend {
 
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Relaxed)
+    }
+
+    /// Whether the backend left its listener (see [`Pool::rebuild`]).
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Relaxed)
     }
 
     /// Updates the health flag and returns the previous value.
@@ -61,6 +70,10 @@ impl Lease {
 
     pub fn addr(&self) -> SocketAddr {
         self.backend.addr
+    }
+
+    pub fn backend(&self) -> &Arc<Backend> {
+        &self.backend
     }
 }
 
@@ -187,6 +200,12 @@ pub enum Algorithm {
     RoundRobin,
     LeastConn,
     IpHash,
+    /// UDP only: each flow goes to the pod named by the USERNAME of its first
+    /// STUN message. The UDP proxy picks those backends itself, with
+    /// [`Pool::lease_addr`]; it needs `stun_username` in the config, so it is
+    /// not offered on the command line.
+    #[value(skip)]
+    StunUsername,
 }
 
 impl Algorithm {
@@ -195,6 +214,9 @@ impl Algorithm {
             Algorithm::RoundRobin => Box::new(RoundRobin::default()),
             Algorithm::LeastConn => Box::new(LeastConnections),
             Algorithm::IpHash => Box::new(IpHash),
+            // Never asked to choose (see the variant); round-robin is a
+            // harmless answer if it ever were.
+            Algorithm::StunUsername => Box::new(RoundRobin::default()),
         }
     }
 }
@@ -239,6 +261,11 @@ impl Pool {
                 None => Arc::new(Backend::new(addr)),
             })
             .collect();
+        for (addr, backend) in existing {
+            if !backends.iter().any(|b| b.addr == addr) {
+                backend.retired.store(true, Ordering::Relaxed);
+            }
+        }
 
         Self {
             backends,
@@ -273,6 +300,15 @@ impl Pool {
             .choose(candidates, client)
             .or_else(|| remaining.iter().next())?;
         Some(Lease::new(Arc::clone(backend)))
+    }
+
+    /// Leases the backend at `addr`, if the pool has it and it is healthy.
+    /// For strategies that pick a backend from the traffic itself.
+    pub fn lease_addr(&self, addr: SocketAddr) -> Option<Lease> {
+        let backend = self.backends.iter().find(|b| b.addr == addr)?;
+        backend
+            .is_healthy()
+            .then(|| Lease::new(Arc::clone(backend)))
     }
 
     pub fn backends(&self) -> &[Arc<Backend>] {
@@ -326,6 +362,22 @@ mod tests {
 
         drop(held);
         assert_eq!(new.backends()[0].active_connections(), 0);
+
+        // The backend left out is retired; the others are not.
+        assert!(old.backends()[0].is_retired());
+        assert!(!new.backends().iter().any(|b| b.is_retired()));
+    }
+
+    #[test]
+    fn leases_a_given_backend_only_while_it_is_healthy() {
+        let pool = Pool::new(addrs(2), Algorithm::StunUsername);
+        let wanted = pool.backends()[1].addr();
+        assert_eq!(pool.lease_addr(wanted).unwrap().addr(), wanted);
+        assert_eq!(pool.backends()[1].active_connections(), 0);
+
+        pool.backends()[1].set_healthy(false);
+        assert!(pool.lease_addr(wanted).is_none());
+        assert!(pool.lease_addr(SocketAddr::from(([127, 0, 0, 1], 99))).is_none());
     }
 
     #[test]
