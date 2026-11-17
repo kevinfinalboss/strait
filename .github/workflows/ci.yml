@@ -23,6 +23,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Test shared XDP types
+        run: cargo test -p strait-common
 
   xdp:
     runs-on: ubuntu-latest
