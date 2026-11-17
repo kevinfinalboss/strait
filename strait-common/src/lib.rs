@@ -101,6 +101,9 @@ pub struct VipStats {
     pub no_backend: u64,
     /// Packets whose flow was not in the flow table and went through Maglev.
     pub new_flows: u64,
+    /// Packets dropped for another reason: the backend has another address
+    /// family than the packet, or there was no headroom for the outer header.
+    pub dropped: u64,
 }
 
 #[cfg(feature = "user")]

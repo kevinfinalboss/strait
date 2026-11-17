@@ -275,6 +275,10 @@ fn balance(ctx: &XdpContext) -> u32 {
         return XDP_DROP;
     };
     if backend.family != packet.family {
+        // Userspace never puts such a backend in a VIP's table; count it all
+        // the same, so a drop here never goes unseen.
+        // SAFETY: per-CPU value, so nothing else writes it concurrently.
+        unsafe { (*stats).dropped += 1 };
         return XDP_DROP;
     }
     let Some(&settings) = SETTINGS.get(0) else {
@@ -288,6 +292,8 @@ fn balance(ctx: &XdpContext) -> u32 {
         encap_v6(ctx, &packet, &backend, &settings)
     };
     if !sent {
+        // SAFETY: per-CPU value, so nothing else writes it concurrently.
+        unsafe { (*stats).dropped += 1 };
         return XDP_DROP;
     }
     // SAFETY: per-CPU value, so nothing else writes it concurrently.
