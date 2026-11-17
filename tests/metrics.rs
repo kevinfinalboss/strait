@@ -199,6 +199,36 @@ async fn backends_removed_by_a_reload_leave_the_gauges() {
 }
 
 #[tokio::test]
+async fn backends_removed_by_a_reload_leave_every_series_once_their_connections_close() {
+    let old = spawn_echo_backend().await;
+    let new = spawn_echo_backend().await;
+    let mut harness = start(&[old]).await;
+    let connections =
+        format!(r#"strait_backend_connections_total{{listener="api",backend="{old}"}}"#);
+
+    let mut client = TcpStream::connect(harness.proxy).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let mut reply = [0u8; 4];
+    client.read_exact(&mut reply).await.unwrap();
+    eventually(&harness, &connections, 1.0).await;
+
+    harness.server.reload(&config(&[new])).await.unwrap();
+
+    // The connection is still open, so its series keep counting.
+    assert_eq!(value(&scrape(&harness).await, &connections), Some(1.0));
+
+    drop(client);
+    let label = format!(r#"backend="{old}""#);
+    let gone = timeout(Duration::from_secs(2), async {
+        while scrape(&harness).await.contains(&label) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(gone.is_ok(), "series of {old} are still exported");
+}
+
+#[tokio::test]
 async fn serves_health_and_rejects_other_paths() {
     let harness = start(&[spawn_echo_backend().await]).await;
 

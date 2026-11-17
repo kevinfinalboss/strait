@@ -1,6 +1,8 @@
 //! Prometheus metrics and the HTTP endpoint that serves them.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -116,6 +118,9 @@ type HistogramFamily<L> = Family<L, Histogram, fn() -> Histogram>;
 /// Counter names are registered without the `_total` suffix; the encoder adds it.
 #[derive(Debug, Clone)]
 pub struct Metrics {
+    /// Live [`BackendMetrics`] by label set, so every route that uses a backend
+    /// shares one handle and its series can be removed when the last one goes.
+    live: Arc<Mutex<HashMap<BackendLabels, Weak<BackendMetrics>>>>,
     pub accepted: Family<ListenerLabels, Counter>,
     pub backend_connections: Family<BackendLabels, Counter>,
     pub connect_failures: Family<ConnectFailureLabels, Counter>,
@@ -139,6 +144,7 @@ fn connection_buckets() -> Histogram {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
+            live: Arc::default(),
             accepted: Family::default(),
             backend_connections: Family::default(),
             connect_failures: Family::default(),
@@ -197,6 +203,132 @@ impl Metrics {
 
     pub fn record_reload(&self, result: ReloadResult) {
         self.reloads.get_or_create(&ReloadLabels { result }).inc();
+    }
+
+    /// Handles for the per-listener series.
+    pub fn listener(&self, listener: &str) -> ListenerMetrics {
+        let error = |reason| {
+            self.connection_errors
+                .get_or_create(&ConnectionErrorLabels {
+                    listener: listener.to_owned(),
+                    reason,
+                })
+                .clone()
+        };
+        ListenerMetrics {
+            accepted: self
+                .accepted
+                .get_or_create(&ListenerLabels {
+                    listener: listener.to_owned(),
+                })
+                .clone(),
+            no_backend: error(ConnectionError::NoBackend),
+            relay_errors: error(ConnectionError::Relay),
+        }
+    }
+
+    /// Handles for the series of `backend` on `listener`.
+    ///
+    /// Returns the existing handles while anything still holds them. When the
+    /// last holder drops them, the series leave the registry, so backends that
+    /// come and go (pods in Kubernetes) do not pile up.
+    pub fn backend(&self, listener: &str, backend: SocketAddr) -> Arc<BackendMetrics> {
+        let labels = BackendLabels {
+            listener: listener.to_owned(),
+            backend: backend.to_string(),
+        };
+        let mut live = self.live.lock().expect("metrics lock poisoned");
+        if let Some(existing) = live.get(&labels).and_then(Weak::upgrade) {
+            return existing;
+        }
+
+        let failure = |reason| {
+            self.connect_failures
+                .get_or_create(&ConnectFailureLabels {
+                    listener: labels.listener.clone(),
+                    backend: labels.backend.clone(),
+                    reason,
+                })
+                .clone()
+        };
+        let handles = Arc::new(BackendMetrics {
+            connections: self.backend_connections.get_or_create(&labels).clone(),
+            connect_duration: self.connect_duration.get_or_create(&labels).clone(),
+            connection_duration: self.connection_duration.get_or_create(&labels).clone(),
+            connect_refused: failure(ConnectFailure::Refused),
+            connect_timeout: failure(ConnectFailure::Timeout),
+            transfer: TransferCounters::new(self, &labels.listener, &labels.backend),
+            labels: labels.clone(),
+            metrics: self.clone(),
+        });
+        live.insert(labels, Arc::downgrade(&handles));
+        handles
+    }
+
+    /// Removes the series of `labels`, unless new handles for them were created
+    /// after the old ones started dropping.
+    fn forget(&self, labels: &BackendLabels) {
+        let mut live = self.live.lock().expect("metrics lock poisoned");
+        if live.get(labels).is_some_and(|weak| weak.strong_count() > 0) {
+            return;
+        }
+        live.remove(labels);
+
+        self.backend_connections.remove(labels);
+        self.connect_duration.remove(labels);
+        self.connection_duration.remove(labels);
+        for reason in [ConnectFailure::Refused, ConnectFailure::Timeout] {
+            self.connect_failures.remove(&ConnectFailureLabels {
+                listener: labels.listener.clone(),
+                backend: labels.backend.clone(),
+                reason,
+            });
+        }
+        for direction in [Direction::Sent, Direction::Received] {
+            self.bytes.remove(&TransferLabels {
+                listener: labels.listener.clone(),
+                backend: labels.backend.clone(),
+                direction,
+            });
+        }
+    }
+}
+
+/// Series of one listener, looked up once so a connection only does atomic adds.
+#[derive(Debug, Clone)]
+pub struct ListenerMetrics {
+    pub accepted: Counter,
+    pub no_backend: Counter,
+    pub relay_errors: Counter,
+}
+
+/// Series of one backend of one listener, looked up once so a connection only
+/// does atomic adds. Created by [`Metrics::backend`]; the series are removed when
+/// the last handle is dropped.
+#[derive(Debug)]
+pub struct BackendMetrics {
+    pub connections: Counter,
+    pub connect_duration: Histogram,
+    pub connection_duration: Histogram,
+    pub connect_refused: Counter,
+    pub connect_timeout: Counter,
+    pub transfer: TransferCounters,
+    labels: BackendLabels,
+    metrics: Metrics,
+}
+
+impl BackendMetrics {
+    pub fn connect_failure(&self, reason: ConnectFailure) -> &Counter {
+        match reason {
+            ConnectFailure::Refused => &self.connect_refused,
+            ConnectFailure::Timeout => &self.connect_timeout,
+        }
+    }
+}
+
+impl Drop for BackendMetrics {
+    fn drop(&mut self) {
+        self.metrics.forget(&self.labels);
     }
 }
 
