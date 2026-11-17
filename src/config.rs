@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -32,10 +32,18 @@ pub struct Config {
 pub struct XdpConfig {
     /// Interface that receives the VIP traffic.
     pub interface: String,
-    /// Source address of the outer IP-in-IP header, usually the interface's own.
-    pub source: Ipv4Addr,
-    /// MAC address of the next hop that routes encapsulated packets to backends.
-    pub gateway_mac: MacAddr,
+    /// Outer source address for IPv4 backends. Defaults to the interface's
+    /// first IPv4 address.
+    #[serde(default)]
+    pub source: Option<Ipv4Addr>,
+    /// Outer source address for IPv6 backends. Defaults to the interface's
+    /// first global IPv6 address; needed only by IPv6 listeners.
+    #[serde(default)]
+    pub source_v6: Option<Ipv6Addr>,
+    /// MAC address of the next hop that routes encapsulated packets to
+    /// backends. Defaults to the MAC of the interface's IPv4 default gateway.
+    #[serde(default)]
+    pub gateway_mac: Option<MacAddr>,
     #[serde(default)]
     pub mode: XdpMode,
 }
@@ -95,6 +103,16 @@ impl<'de> Deserialize<'de> for MacAddr {
     }
 }
 
+/// Transport protocol of a listener.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Protocol {
+    #[default]
+    Tcp,
+    /// Only with `dataplane: xdp`.
+    Udp,
+}
+
 /// How a listener moves traffic to its backends.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -122,6 +140,8 @@ pub struct ListenerConfig {
     pub listen: SocketAddr,
     #[serde(default)]
     pub dataplane: Dataplane,
+    #[serde(default)]
+    pub protocol: Protocol,
     /// Fixed backend addresses. Exactly one of `backends` and `kubernetes` is set.
     #[serde(default)]
     pub backends: Vec<SocketAddr>,
@@ -162,6 +182,11 @@ pub enum ServicePort {
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct HealthCheckConfig {
+    /// Off means every backend is always considered healthy.
+    pub enabled: bool,
+    /// TCP port to probe instead of the backend's own, for example a health
+    /// endpoint next to a UDP service.
+    pub port: Option<u16>,
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
     #[serde(with = "humantime_serde")]
@@ -174,6 +199,8 @@ impl Default for HealthCheckConfig {
     fn default() -> Self {
         let defaults = HealthCheck::default();
         Self {
+            enabled: defaults.enabled,
+            port: defaults.port,
             interval: defaults.interval,
             timeout: defaults.timeout,
             unhealthy_threshold: defaults.unhealthy_threshold,
@@ -220,7 +247,7 @@ impl Config {
         let mut names = HashSet::new();
         let mut addrs = HashSet::new();
         if let Some(metrics) = self.metrics {
-            addrs.insert(metrics.listen);
+            addrs.insert((metrics.listen, Protocol::Tcp));
         }
         for listener in &self.listeners {
             let name = &listener.name;
@@ -230,7 +257,9 @@ impl Config {
             if !names.insert(name) {
                 bail!("listener name {name:?} is used more than once");
             }
-            if !addrs.insert(listener.listen) {
+            // XDP listeners on the same address can differ by protocol (DNS over
+            // TCP and UDP, say); the metrics endpoint and proxies are TCP.
+            if !addrs.insert((listener.listen, listener.protocol)) {
                 bail!(
                     "listener {name:?}: address {} is used by another listener or the metrics endpoint",
                     listener.listen
@@ -289,20 +318,31 @@ impl ListenerConfig {
             bail!("health_check thresholds must be at least 1");
         }
 
+        if self.protocol == Protocol::Udp && self.dataplane != Dataplane::Xdp {
+            bail!("protocol udp needs dataplane: xdp; the proxy relays TCP only");
+        }
+        if self.protocol == Protocol::Udp
+            && self.health_check.enabled
+            && self.health_check.port.is_none()
+        {
+            bail!(
+                "health checks are TCP connects: a udp listener needs health_check.port (a TCP port on the backends) or health_check.enabled: false"
+            );
+        }
         if self.dataplane == Dataplane::Xdp {
             // The VIP is not bound to a socket: packets to it are caught on the
             // wire, so it needs a real address and port.
-            if !matches!(self.listen.ip(), IpAddr::V4(ip) if !ip.is_unspecified())
-                || self.listen.port() == 0
-            {
+            if self.listen.ip().is_unspecified() || self.listen.port() == 0 {
                 bail!(
-                    "dataplane xdp needs an IPv4 listen address and port (the VIP), got {}",
+                    "dataplane xdp needs a specific listen address and port (the VIP), got {}",
                     self.listen
                 );
             }
             for backend in &self.backends {
-                if !backend.is_ipv4() {
-                    bail!("dataplane xdp supports IPv4 backends only, got {backend}");
+                if backend.is_ipv4() != self.listen.is_ipv4() {
+                    bail!(
+                        "backend {backend}: with dataplane xdp, backends must have the VIP's address family"
+                    );
                 }
                 // Packets keep their destination port: backends get them on the
                 // VIP's port, and the backend port is only used by health checks.
@@ -327,6 +367,8 @@ impl ListenerConfig {
 
     pub fn health(&self) -> HealthCheck {
         HealthCheck {
+            enabled: self.health_check.enabled,
+            port: self.health_check.port,
             interval: self.health_check.interval,
             timeout: self.health_check.timeout,
             unhealthy_threshold: self.health_check.unhealthy_threshold,
@@ -481,8 +523,11 @@ listeners:
         }
         let config = Config::parse(XDP).unwrap();
         let xdp = config.xdp.unwrap();
-        assert_eq!(xdp.gateway_mac.0, [0xaa, 0xbb, 0xcc, 0x00, 0x11, 0x22]);
-        assert_eq!(xdp.gateway_mac.to_string(), "aa:bb:cc:00:11:22");
+        let mac = xdp.gateway_mac.unwrap();
+        assert_eq!(mac.0, [0xaa, 0xbb, 0xcc, 0x00, 0x11, 0x22]);
+        assert_eq!(mac.to_string(), "aa:bb:cc:00:11:22");
+        assert_eq!(xdp.source, Some("10.0.2.2".parse().unwrap()));
+        assert_eq!(config.listeners[0].protocol, Protocol::Tcp);
         assert_eq!(xdp.mode, XdpMode::Auto);
         assert_eq!(config.listeners[0].dataplane, Dataplane::Xdp);
     }
@@ -506,6 +551,27 @@ listeners:
                     .contains("IPv4 listen address")
             );
         }
+    }
+
+    #[test]
+    fn checks_udp_listeners() {
+        let proxy_udp = "listeners:\n  - name: dns\n    listen: 127.0.0.1:53\n    protocol: udp\n    backends: [127.0.0.1:5353]\n";
+        assert!(error(proxy_udp).contains("needs dataplane: xdp"));
+        if !cfg!(feature = "xdp") {
+            return;
+        }
+        let udp = XDP.replace("dataplane: xdp", "dataplane: xdp\n    protocol: udp");
+        assert!(error(&udp).contains("health_check.port"));
+        let probed = format!("{udp}    health_check:\n      port: 8080\n");
+        let config = Config::parse(&probed).unwrap();
+        assert_eq!(config.listeners[0].health().port, Some(8080));
+        assert!(Config::parse(&format!("{udp}    health_check:\n      enabled: false\n")).is_ok());
+
+        // The same VIP over TCP and UDP is two listeners.
+        let both = format!(
+            "{XDP}  - name: web-udp\n    listen: 10.0.0.10:80\n    dataplane: xdp\n    protocol: udp\n    backends: [10.0.3.2:80]\n    health_check:\n      enabled: false\n"
+        );
+        assert_eq!(Config::parse(&both).unwrap().listeners.len(), 2);
     }
 
     #[test]
