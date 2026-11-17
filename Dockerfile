@@ -4,7 +4,12 @@ FROM rust:1.99-slim-trixie AS build
 WORKDIR /src
 
 # Build dependencies in their own layer, so editing the code does not rebuild them.
-COPY Cargo.toml Cargo.lock ./
+# The XDP crates are workspace members, so cargo needs them to read the
+# workspace; the image itself is built without the xdp feature.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY strait-common strait-common
+COPY strait-ebpf strait-ebpf
+COPY examples examples
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && touch src/lib.rs \
     && cargo build --release --locked --bin strait \
     && rm -rf src
