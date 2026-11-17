@@ -7,7 +7,20 @@ description = "A Layer 4 load balancer written in Rust"
 license = "MIT"
 repository = "https://github.com/kevinfinalboss/strait"
 
+[workspace]
+# strait-ebpf only builds for the BPF target; the build script compiles it when
+# the `xdp` feature is on, so plain `cargo build`/`cargo test` leave it out.
+members = ["strait-common", "strait-ebpf"]
+default-members = ["."]
+
+[features]
+# XDP data plane (Linux only). Needs nightly with rust-src and bpf-linker at
+# build time; see "XDP data plane" in the README.
+xdp = ["dep:aya", "dep:aya-build", "dep:strait-common", "strait-common/user"]
+
 [dependencies]
+aya = { version = "0.16.0", optional = true }
+strait-common = { path = "strait-common", optional = true }
 anyhow = "1.0.104"
 arc-swap = "1.9.5"
 clap = { version = "4.6.7", features = ["derive"] }
@@ -24,3 +37,10 @@ tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[build-dependencies]
+aya-build = { version = "0.2.1", optional = true }
+
+[profile.release.package.strait-ebpf]
+debug = 2
+codegen-units = 1
