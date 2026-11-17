@@ -62,7 +62,9 @@ enum Frontend {
 
 /// Whether `running` can be updated in place to `config`.
 fn same_listener(running: &ListenerConfig, config: &ListenerConfig) -> bool {
-    running.listen == config.listen && running.dataplane == config.dataplane
+    running.listen == config.listen
+        && running.dataplane == config.dataplane
+        && running.protocol == config.protocol
 }
 
 /// The parts of a listener that a reload or a discovery update can change.
@@ -315,12 +317,10 @@ impl Running {
             }
             #[cfg(feature = "xdp")]
             Frontend::Xdp(dataplane) => {
-                let std::net::SocketAddr::V4(vip) = running.config.listen else {
-                    unreachable!("validate requires an IPv4 VIP");
-                };
                 running._xdp = Some(crate::xdp::Binding::start(
                     dataplane,
-                    vip,
+                    running.config.listen,
+                    running.config.protocol,
                     Arc::clone(&running.upstream.route),
                     span,
                 ));
