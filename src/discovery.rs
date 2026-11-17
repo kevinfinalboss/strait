@@ -36,57 +36,87 @@ pub fn spawn(
             .default_backoff()
             .boxed();
 
-        // Slices of the service by name; rebuilt from scratch on every relist.
-        let mut slices: BTreeMap<String, EndpointSlice> = BTreeMap::new();
-        let mut initial: BTreeMap<String, EndpointSlice> = BTreeMap::new();
-        let mut syncing = false;
-        let mut current: Option<Vec<SocketAddr>> = None;
-
+        let mut state = EndpointState::default();
         while let Some(event) = events.next().await {
-            match event {
-                Ok(Event::Init) => {
-                    syncing = true;
-                    initial.clear();
-                }
-                Ok(Event::InitApply(slice)) => {
-                    initial.insert(slice.name_any(), slice);
-                }
-                Ok(Event::InitDone) => {
-                    syncing = false;
-                    slices = std::mem::take(&mut initial);
-                }
-                Ok(Event::Apply(slice)) => {
-                    slices.insert(slice.name_any(), slice);
-                }
-                Ok(Event::Delete(slice)) => {
-                    slices.remove(&slice.name_any());
-                }
+            let event = match event {
+                Ok(event) => event,
                 Err(err) => {
                     // The watcher retries with backoff; this usually means missing RBAC
                     // or an unreachable API server.
                     warn!(service = %source.service, %namespace, error = %err, "endpoint watch failed");
                     continue;
                 }
-            }
-
-            // During a (re)list, wait for the full list before publishing anything.
-            if syncing {
-                continue;
-            }
-
-            let backends = ready_backends(slices.values(), &source.port);
-            if current.as_ref() != Some(&backends) {
+            };
+            if let Some(backends) = state.apply(event, &source.port) {
                 info!(
                     service = %source.service,
                     %namespace,
                     backends = backends.len(),
                     "kubernetes endpoints updated"
                 );
-                update(backends.clone());
-                current = Some(backends);
+                update(backends);
             }
         }
     }.instrument(span))
+}
+
+/// What the watch has seen of a Service's EndpointSlices.
+///
+/// Kept apart from the watch itself so the event handling can be tested
+/// without an API server.
+#[derive(Debug, Default)]
+pub struct EndpointState {
+    /// Slices of the service by name, as of the last complete list.
+    slices: BTreeMap<String, EndpointSlice>,
+    /// Slices of a (re)list in progress; replaces `slices` when it completes.
+    initial: BTreeMap<String, EndpointSlice>,
+    syncing: bool,
+    /// Last list handed out, so an unchanged list is not published again.
+    current: Option<Vec<SocketAddr>>,
+}
+
+impl EndpointState {
+    /// Applies one watch event. Returns the new backend list when it changed.
+    ///
+    /// During a (re)list nothing is published until the list is complete, so a
+    /// relist never shrinks the backends to the slices seen so far. A completed
+    /// relist replaces everything, which drops slices deleted while the watch
+    /// was disconnected.
+    pub fn apply(
+        &mut self,
+        event: Event<EndpointSlice>,
+        port: &ServicePort,
+    ) -> Option<Vec<SocketAddr>> {
+        match event {
+            Event::Init => {
+                self.syncing = true;
+                self.initial.clear();
+            }
+            Event::InitApply(slice) => {
+                self.initial.insert(slice.name_any(), slice);
+            }
+            Event::InitDone => {
+                self.syncing = false;
+                self.slices = std::mem::take(&mut self.initial);
+            }
+            Event::Apply(slice) => {
+                self.slices.insert(slice.name_any(), slice);
+            }
+            Event::Delete(slice) => {
+                self.slices.remove(&slice.name_any());
+            }
+        }
+        if self.syncing {
+            return None;
+        }
+
+        let backends = ready_backends(self.slices.values(), port);
+        if self.current.as_ref() == Some(&backends) {
+            return None;
+        }
+        self.current = Some(backends.clone());
+        Some(backends)
+    }
 }
 
 /// Ready endpoint addresses of `slices` on `port`, sorted and without duplicates.
@@ -247,6 +277,110 @@ mod tests {
         let backends = ready_backends(&slices, &ServicePort::Name("http".into()));
 
         assert_eq!(backends, addrs(&["10.0.0.1:80", "[fd00::1]:80"]));
+    }
+
+    fn named(name: &str, addresses: &[&str]) -> EndpointSlice {
+        let mut slice = slice(
+            "IPv4",
+            &[("http", 80)],
+            addresses.iter().map(|a| endpoint(a, Some(true))).collect(),
+        );
+        slice.metadata.name = Some(name.into());
+        slice
+    }
+
+    fn http() -> ServicePort {
+        ServicePort::Name("http".into())
+    }
+
+    #[test]
+    fn publishes_the_initial_list_only_once_it_is_complete() {
+        let mut state = EndpointState::default();
+
+        assert_eq!(state.apply(Event::Init, &http()), None);
+        assert_eq!(
+            state.apply(Event::InitApply(named("a", &["10.0.0.1"])), &http()),
+            None
+        );
+        assert_eq!(
+            state.apply(Event::InitApply(named("b", &["10.0.0.2"])), &http()),
+            None
+        );
+        assert_eq!(
+            state.apply(Event::InitDone, &http()),
+            Some(addrs(&["10.0.0.1:80", "10.0.0.2:80"]))
+        );
+    }
+
+    #[test]
+    fn an_empty_service_publishes_an_empty_list() {
+        let mut state = EndpointState::default();
+        state.apply(Event::Init, &http());
+        assert_eq!(state.apply(Event::InitDone, &http()), Some(vec![]));
+    }
+
+    #[test]
+    fn follows_changes_and_skips_ones_that_change_nothing() {
+        let mut state = EndpointState::default();
+        state.apply(Event::Init, &http());
+        state.apply(Event::InitApply(named("a", &["10.0.0.1"])), &http());
+        state.apply(Event::InitDone, &http());
+
+        // A new slice adds its endpoints.
+        assert_eq!(
+            state.apply(Event::Apply(named("b", &["10.0.0.2"])), &http()),
+            Some(addrs(&["10.0.0.1:80", "10.0.0.2:80"]))
+        );
+        // Same endpoints again (a label change, say): nothing to publish.
+        assert_eq!(
+            state.apply(Event::Apply(named("b", &["10.0.0.2"])), &http()),
+            None
+        );
+        // A pod becoming unready leaves the list.
+        let mut unready = named("b", &[]);
+        unready.endpoints = Some(vec![endpoint("10.0.0.2", Some(false))]);
+        assert_eq!(
+            state.apply(Event::Apply(unready), &http()),
+            Some(addrs(&["10.0.0.1:80"]))
+        );
+        // Deleting a slice removes its endpoints.
+        assert_eq!(
+            state.apply(Event::Delete(named("a", &["10.0.0.1"])), &http()),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn a_relist_keeps_the_old_list_until_done_then_drops_stale_slices() {
+        let mut state = EndpointState::default();
+        state.apply(Event::Init, &http());
+        state.apply(Event::InitApply(named("a", &["10.0.0.1"])), &http());
+        state.apply(Event::InitApply(named("b", &["10.0.0.2"])), &http());
+        state.apply(Event::InitDone, &http());
+
+        // The watch reconnects; slice "a" was deleted while it was down.
+        assert_eq!(state.apply(Event::Init, &http()), None);
+        assert_eq!(
+            state.apply(Event::InitApply(named("b", &["10.0.0.2"])), &http()),
+            None
+        );
+        assert_eq!(
+            state.apply(Event::InitDone, &http()),
+            Some(addrs(&["10.0.0.2:80"]))
+        );
+    }
+
+    #[test]
+    fn a_relist_with_no_change_publishes_nothing() {
+        let mut state = EndpointState::default();
+        for _ in 0..2 {
+            state.apply(Event::Init, &http());
+            state.apply(Event::InitApply(named("a", &["10.0.0.1"])), &http());
+            state.apply(Event::InitDone, &http());
+        }
+        state.apply(Event::Init, &http());
+        state.apply(Event::InitApply(named("a", &["10.0.0.1"])), &http());
+        assert_eq!(state.apply(Event::InitDone, &http()), None);
     }
 
     #[test]
