@@ -42,6 +42,18 @@ second         a       b       c  errors
 
 The 2 errors are the requests that were in flight on `b` when it was stopped. An L4 load balancer cannot replay a connection that already exchanged bytes. Every new connection that was routed to `b` after that was retried on `a` or `c` until the health check took `b` out of rotation.
 
+## Kubernetes
+
+```bash
+demo/kubernetes.sh        # create a kind cluster, deploy, then run the scaling scenario
+demo/kubernetes.sh scale  # rerun only the scenario
+demo/kubernetes.sh down   # delete the cluster
+```
+
+Needs docker, kind, kubectl and helm. The script builds the strait image, loads it into kind, deploys [`kubernetes/web.yaml`](kubernetes/web.yaml) (a Deployment that answers with its pod name) and installs the chart with [`kubernetes/values.yaml`](kubernetes/values.yaml). It then sends traffic through `kubectl port-forward` while the Deployment scales 3 → 5 → 1 → 3 and prints which pod served each request, second by second.
+
+`load.py` stops reading once the body matches `Content-Length` instead of waiting for the server to close. `kubectl port-forward` takes about a second to relay a close, which otherwise shows up as one second of latency on every request.
+
 ## Benchmark
 
 ```bash
