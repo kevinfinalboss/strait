@@ -64,6 +64,9 @@ struct Vip {
     indices: HashMap<IpAddr, u32>,
     /// What the kernel table holds, so an update only writes slots that changed.
     table: Vec<u32>,
+    /// Whether the VIP is in the kernel's `VIPS` map. A first `set` that fails
+    /// halfway leaves it out, and the next `set` publishes it.
+    published: bool,
 }
 
 /// The settings the program runs with, after filling in what the config left
@@ -152,7 +155,8 @@ impl DataPlane {
     /// Writes happen in an order that never sends a packet nowhere: new
     /// backends are published first, then the table entries that change, then
     /// backends that left are marked inactive (which also rebalances the flows
-    /// remembered for them). The VIP itself is published last.
+    /// remembered for them). The VIP itself is published last, once a `set` of
+    /// it gets that far.
     pub fn set(
         &self,
         listener: &str,
@@ -169,8 +173,7 @@ impl DataPlane {
             );
         }
 
-        let is_new = !inner.active.contains_key(&key);
-        if is_new {
+        if !inner.active.contains_key(&key) {
             let used: Vec<u32> = inner.active.values().map(|v| v.slot).collect();
             let Some(slot) = (0..MAX_VIPS).find(|slot| !used.contains(slot)) else {
                 bail!("the XDP data plane supports at most {MAX_VIPS} listeners");
@@ -182,6 +185,7 @@ impl DataPlane {
                     listener: listener.to_owned(),
                     indices: HashMap::new(),
                     table: Vec::new(),
+                    published: false,
                 },
             );
         }
@@ -240,7 +244,7 @@ impl DataPlane {
             vip_state.indices.remove(&addr);
         }
 
-        if is_new {
+        if !vip_state.published {
             // A reused slot must not carry the counters of its previous VIP.
             let cpus = aya::util::nr_cpus()
                 .map_err(|(path, err)| anyhow!("{path}: {err}"))?
@@ -251,6 +255,7 @@ impl DataPlane {
                 0,
             )?;
             inner.vips.insert(&key, &slot, 0)?;
+            vip_state.published = true;
         }
         Ok(())
     }
@@ -262,7 +267,9 @@ impl DataPlane {
         let Some(state) = inner.active.remove(&key) else {
             return;
         };
-        if let Err(err) = inner.vips.remove(&key) {
+        if state.published
+            && let Err(err) = inner.vips.remove(&key)
+        {
             warn!(%vip, error = %err, "could not remove VIP from the XDP data plane");
         }
         // Flows remembered for this VIP must not survive into the slot's next VIP.
@@ -281,6 +288,7 @@ impl DataPlane {
         inner
             .active
             .values()
+            .filter(|vip| vip.published)
             .map(|vip| {
                 let total = inner
                     .stats
@@ -293,6 +301,7 @@ impl DataPlane {
                                 bytes: sum.bytes + cpu.bytes,
                                 no_backend: sum.no_backend + cpu.no_backend,
                                 new_flows: sum.new_flows + cpu.new_flows,
+                                dropped: sum.dropped + cpu.dropped,
                             })
                     })
                     .unwrap_or_default();
@@ -528,11 +537,26 @@ async fn sync(
     let mut ticker = interval(SYNC_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut applied: Option<(String, Vec<IpAddr>)> = None;
+    let mut unusable: Vec<SocketAddr> = Vec::new();
 
     loop {
         ticker.tick().await;
         let route = route.load();
-        let wanted = (route.name.to_string(), serving(&route));
+        let serving = serving(&route, vip);
+        if serving.unusable != unusable {
+            if !serving.unusable.is_empty() {
+                // Static backends are checked by the config; these come from
+                // Kubernetes, where a dual-stack Service or a targetPort that
+                // differs from the VIP port produces them.
+                warn!(
+                    %vip,
+                    skipped = ?serving.unusable,
+                    "skipping backends the XDP data plane cannot reach: they need the VIP's address family and port"
+                );
+            }
+            unusable = serving.unusable;
+        }
+        let wanted = (route.name.to_string(), serving.backends);
         if applied.as_ref() == Some(&wanted) {
             continue;
         }
@@ -555,23 +579,42 @@ async fn sync(
     }
 }
 
+/// The backends of a route as the XDP data plane sees them.
+#[derive(Debug, PartialEq, Eq)]
+struct Serving {
+    /// Addresses that should get traffic.
+    backends: Vec<IpAddr>,
+    /// Backends left out because packets cannot reach them as they are.
+    unusable: Vec<SocketAddr>,
+}
+
 /// Backends that should get traffic: the healthy ones, or every one if none is
 /// healthy (fail open, like the proxy).
-fn serving(route: &Route) -> Vec<IpAddr> {
-    let backends = route.pool.backends();
-    let healthy: Vec<IpAddr> = backends
+///
+/// Packets are forwarded with their own destination port and inside a header
+/// of their own family, so a backend with another family or port than `vip`
+/// could never get them: it is left out, whatever its health.
+fn serving(route: &Route, vip: SocketAddr) -> Serving {
+    let (usable, mut unusable): (Vec<_>, Vec<_>) = route
+        .pool
+        .backends()
+        .iter()
+        .partition(|b| b.addr().is_ipv4() == vip.is_ipv4() && b.addr().port() == vip.port());
+    let healthy: Vec<IpAddr> = usable
         .iter()
         .filter(|b| b.is_healthy())
         .map(|b| b.addr().ip())
         .collect();
-    let mut chosen = if healthy.is_empty() {
-        backends.iter().map(|b| b.addr().ip()).collect()
+    let mut backends = if healthy.is_empty() {
+        usable.iter().map(|b| b.addr().ip()).collect()
     } else {
         healthy
     };
-    chosen.sort_unstable();
-    chosen.dedup();
-    chosen
+    backends.sort_unstable();
+    backends.dedup();
+    let mut unusable: Vec<SocketAddr> = unusable.drain(..).map(|b| b.addr()).collect();
+    unusable.sort_unstable();
+    Serving { backends, unusable }
 }
 
 /// Name, help and value of one counter family.
@@ -600,7 +643,7 @@ impl Collector for XdpStats {
         let dataplane = self.dataplane.lock().expect("stats lock poisoned").clone();
         let rows = dataplane.map(|dp| dp.stats()).unwrap_or_default();
 
-        let series: [Series; 4] = [
+        let series: [Series; 5] = [
             (
                 "strait_xdp_packets",
                 "Packets sent to a backend by the XDP data plane",
@@ -620,6 +663,11 @@ impl Collector for XdpStats {
                 "strait_xdp_new_flows",
                 "Packets whose flow was not in the flow table and was placed by Maglev",
                 |s| s.new_flows,
+            ),
+            (
+                "strait_xdp_dropped",
+                "Packets the XDP data plane dropped for another reason: a backend of the wrong address family, or no headroom for the outer header",
+                |s| s.dropped,
             ),
         ];
         for (name, help, value) in series {
@@ -678,6 +726,71 @@ IP address       HW type     Flags       HW address            Mask     Device
         );
         // Right address, wrong interface.
         assert_eq!(neighbour_mac(ARP, Ipv4Addr::new(10, 0, 2, 1), "eth1"), None);
+    }
+
+    fn route(backends: &[&str]) -> Route {
+        let pool = crate::Pool::new(
+            backends.iter().map(|b| b.parse().unwrap()),
+            crate::Algorithm::RoundRobin,
+        );
+        Route::new(
+            "web",
+            Arc::new(pool),
+            crate::ProxyConfig::default(),
+            Arc::new(crate::Metrics::default()),
+            tokio_util::task::TaskTracker::new(),
+        )
+    }
+
+    fn ips(addrs: &[&str]) -> Vec<IpAddr> {
+        addrs.iter().map(|a| a.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn serves_healthy_backends_and_fails_open() {
+        let vip = "10.0.0.10:80".parse().unwrap();
+        let route = route(&["10.0.3.3:80", "10.0.3.2:80"]);
+        assert_eq!(
+            serving(&route, vip).backends,
+            ips(&["10.0.3.2", "10.0.3.3"])
+        );
+
+        route.pool.backends()[0].set_healthy(false);
+        assert_eq!(serving(&route, vip).backends, ips(&["10.0.3.2"]));
+
+        route.pool.backends()[1].set_healthy(false);
+        assert_eq!(
+            serving(&route, vip).backends,
+            ips(&["10.0.3.2", "10.0.3.3"])
+        );
+    }
+
+    #[test]
+    fn leaves_out_backends_of_another_family_or_port() {
+        // What discovery hands over for a dual-stack Service, or one whose
+        // targetPort is not the VIP port.
+        let route = route(&["10.0.3.2:80", "[fd00::2]:80", "10.0.3.3:8080"]);
+
+        let v4 = serving(&route, "10.0.0.10:80".parse().unwrap());
+        assert_eq!(v4.backends, ips(&["10.0.3.2"]));
+        assert_eq!(
+            v4.unusable,
+            vec![
+                "10.0.3.3:8080".parse().unwrap(),
+                "[fd00::2]:80".parse().unwrap()
+            ]
+        );
+
+        let v6 = serving(&route, "[fd00::10]:80".parse().unwrap());
+        assert_eq!(v6.backends, ips(&["fd00::2"]));
+        assert_eq!(v6.unusable.len(), 2);
+
+        // Failing open never brings an unusable backend back.
+        route.pool.backends()[0].set_healthy(false);
+        assert_eq!(
+            serving(&route, "10.0.0.10:80".parse().unwrap()).backends,
+            ips(&["10.0.3.2"])
+        );
     }
 
     #[test]

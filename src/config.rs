@@ -548,7 +548,11 @@ listeners:
             assert!(error(&XDP.replace("10.0.3.3:80", "10.0.3.3:8080")).contains("VIP port 80"));
             assert!(
                 error(&XDP.replace("listen: 10.0.0.10:80", "listen: 0.0.0.0:80"))
-                    .contains("IPv4 listen address")
+                    .contains("specific listen address")
+            );
+            assert!(
+                error(&XDP.replace("10.0.3.3:80", "\"[fd00::3]:80\""))
+                    .contains("VIP's address family")
             );
         }
     }
