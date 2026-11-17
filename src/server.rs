@@ -116,6 +116,7 @@ impl Server {
 
         // Bind every new address before touching anything, so a port that is
         // already taken aborts the reload with the old listeners still running.
+        // Past this loop nothing can fail, so a reload applies fully or not at all.
         let mut bound = Vec::new();
         for listener in &config.listeners {
             if !self
@@ -129,7 +130,10 @@ impl Server {
                         listener.name, listener.listen
                     )
                 })?;
-                bound.push((listener.listen, socket));
+                let local_addr = socket.local_addr().with_context(|| {
+                    format!("listener {:?}: bound address unknown", listener.name)
+                })?;
+                bound.push((listener.listen, socket, local_addr));
             }
         }
 
@@ -155,16 +159,17 @@ impl Server {
                 None => {
                     let index = bound
                         .iter()
-                        .position(|(addr, _)| *addr == listener.listen)
+                        .position(|(addr, _, _)| *addr == listener.listen)
                         .expect("every new address was bound above");
-                    let (_, socket) = bound.swap_remove(index);
+                    let (_, socket, local_addr) = bound.swap_remove(index);
                     self.listeners.push(Running::start(
                         listener.clone(),
                         socket,
+                        local_addr,
                         &self.metrics,
                         &self.connections,
                         self.kube.as_ref(),
-                    )?);
+                    ));
                     summary.added.push(name);
                 }
             }
@@ -205,11 +210,11 @@ impl Running {
     fn start(
         config: ListenerConfig,
         socket: TcpListener,
+        local_addr: SocketAddr,
         metrics: &Arc<Metrics>,
         connections: &TaskTracker,
         kube: Option<&Client>,
-    ) -> Result<Self> {
-        let local_addr = socket.local_addr()?;
+    ) -> Self {
         let upstream = Arc::new(Upstream::new(
             config.clone(),
             Arc::clone(metrics),
@@ -228,13 +233,13 @@ impl Running {
         });
         let discovery = start_discovery(&config, &upstream, kube);
 
-        Ok(Self {
+        Self {
             config,
             local_addr,
             upstream,
             accept,
             discovery,
-        })
+        }
     }
 
     /// Applies new settings in place. Backends that stay keep their state.
@@ -332,8 +337,9 @@ impl Upstream {
             config.strategy,
         ));
 
-        // Replacing the guard stops the health checks of the previous pool.
-        state.health = health::spawn(&pool, config.health());
+        // Backends that stay keep their running check; see `HealthChecks::update`.
+        let health = config.health();
+        state.health.update(&pool, health);
         self.route.store(Arc::new(Route::new(
             config.name.as_str(),
             pool,

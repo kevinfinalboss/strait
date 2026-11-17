@@ -1,5 +1,7 @@
 //! Active health checks: periodically open a TCP connection to every backend.
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +13,7 @@ use tracing::{info, warn};
 use crate::balancer::{Backend, Pool};
 
 /// How backends are probed and how many results it takes to change their state.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthCheck {
     /// Time between two probes of the same backend.
     pub interval: Duration,
@@ -34,29 +36,64 @@ impl Default for HealthCheck {
     }
 }
 
-/// The running health check tasks of one pool. Dropping it stops them.
+/// The running health check tasks of one pool, one per backend. Dropping it stops them.
 #[must_use = "health checks stop as soon as this is dropped"]
 #[derive(Debug)]
 pub struct HealthChecks {
-    tasks: Vec<JoinHandle<()>>,
+    config: HealthCheck,
+    tasks: HashMap<SocketAddr, Probing>,
 }
 
-impl Drop for HealthChecks {
+/// The health check task of one backend.
+#[derive(Debug)]
+struct Probing {
+    backend: Arc<Backend>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for Probing {
     fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
+        self.task.abort();
+    }
+}
+
+impl HealthChecks {
+    /// Follows a rebuilt pool: backends that stay keep their running check, with
+    /// its schedule and its count of consecutive results; only backends that
+    /// joined get a new one, and backends that left stop being probed.
+    ///
+    /// A different `config` restarts every check, since the thresholds and the
+    /// interval of a running check cannot change.
+    pub fn update(&mut self, pool: &Pool, config: HealthCheck) {
+        if config != self.config {
+            self.tasks.clear();
+            self.config = config;
         }
+
+        let mut previous = std::mem::take(&mut self.tasks);
+        for backend in pool.backends() {
+            let probing = match previous.remove(&backend.addr()) {
+                // Same `Backend`, so the same health flag the task is updating.
+                Some(probing) if Arc::ptr_eq(&probing.backend, backend) => probing,
+                _ => Probing {
+                    backend: Arc::clone(backend),
+                    task: tokio::spawn(watch(Arc::clone(backend), config)),
+                },
+            };
+            self.tasks.insert(backend.addr(), probing);
+        }
+        // Whatever is left in `previous` is dropped here, which stops it.
     }
 }
 
 /// Starts one background task per backend that keeps its health flag up to date.
 pub fn spawn(pool: &Pool, config: HealthCheck) -> HealthChecks {
-    let tasks = pool
-        .backends()
-        .iter()
-        .map(|backend| tokio::spawn(watch(Arc::clone(backend), config)))
-        .collect();
-    HealthChecks { tasks }
+    let mut checks = HealthChecks {
+        config,
+        tasks: HashMap::new(),
+    };
+    checks.update(pool, config);
+    checks
 }
 
 async fn watch(backend: Arc<Backend>, config: HealthCheck) {

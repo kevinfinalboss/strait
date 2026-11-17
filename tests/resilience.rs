@@ -207,3 +207,53 @@ async fn idle_timeout_closes_a_client_that_stops_reading() {
     eventually(|| backend.active_connections() == 1).await;
     eventually(|| backend.active_connections() == 0).await;
 }
+
+/// Starts a backend that counts the connections it accepts, health probes included.
+async fn spawn_counting_backend() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while listener.accept().await.is_ok() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    (addr, accepted)
+}
+
+#[tokio::test]
+async fn a_rebuilt_pool_only_starts_checks_for_new_backends() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // A check probes once when it starts, then waits an hour: every probe seen
+    // below comes from a check that was (re)started.
+    let config = HealthCheck {
+        interval: Duration::from_secs(3600),
+        ..HealthCheck::default()
+    };
+    let (kept, kept_probes) = spawn_counting_backend().await;
+    let (added, added_probes) = spawn_counting_backend().await;
+
+    let pool = Pool::new([kept], Algorithm::RoundRobin);
+    let mut checks = strait::spawn_health_checks(&pool, config);
+    eventually(|| kept_probes.load(Relaxed) == 1).await;
+
+    let pool = Pool::rebuild(Some(&pool), [kept, added], Algorithm::RoundRobin);
+    checks.update(&pool, config);
+    eventually(|| added_probes.load(Relaxed) == 1).await;
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        kept_probes.load(Relaxed),
+        1,
+        "the kept backend was probed again"
+    );
+
+    // New settings restart every check.
+    let config = HealthCheck {
+        timeout: Duration::from_millis(500),
+        ..config
+    };
+    checks.update(&pool, config);
+    eventually(|| kept_probes.load(Relaxed) == 2 && added_probes.load(Relaxed) == 2).await;
+}

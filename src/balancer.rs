@@ -1,5 +1,6 @@
 //! Backend pool and load balancing strategies.
 
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -221,16 +222,22 @@ impl Pool {
         addrs: impl IntoIterator<Item = SocketAddr>,
         algorithm: Algorithm,
     ) -> Self {
-        let existing = |addr: SocketAddr| {
-            previous?
-                .backends
-                .iter()
-                .find(|backend| backend.addr == addr)
-                .cloned()
-        };
+        // Indexed by address so a rebuild is linear in the pool size, which
+        // matters for Services with many pods that change often.
+        let existing: HashMap<SocketAddr, &Arc<Backend>> = previous
+            .map(|pool| {
+                pool.backends
+                    .iter()
+                    .map(|backend| (backend.addr, backend))
+                    .collect()
+            })
+            .unwrap_or_default();
         let backends: Vec<_> = addrs
             .into_iter()
-            .map(|addr| existing(addr).unwrap_or_else(|| Arc::new(Backend::new(addr))))
+            .map(|addr| match existing.get(&addr) {
+                Some(backend) => Arc::clone(backend),
+                None => Arc::new(Backend::new(addr)),
+            })
             .collect();
 
         Self {
