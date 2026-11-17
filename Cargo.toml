@@ -16,10 +16,11 @@ default-members = ["."]
 [features]
 # XDP data plane (Linux only). Needs nightly with rust-src and bpf-linker at
 # build time; see "XDP data plane" in the README.
-xdp = ["dep:aya", "dep:aya-build", "dep:strait-common", "strait-common/user"]
+xdp = ["dep:aya", "dep:aya-build", "dep:libc", "dep:strait-common", "strait-common/user"]
 
 [dependencies]
 aya = { version = "0.16.0", optional = true }
+libc = { version = "0.2.191", optional = true }
 strait-common = { path = "strait-common", optional = true }
 anyhow = "1.0.104"
 arc-swap = "1.9.5"
