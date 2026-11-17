@@ -44,9 +44,18 @@ pub struct XdpConfig {
     /// backends. Defaults to the MAC of the interface's IPv4 default gateway.
     #[serde(default)]
     pub gateway_mac: Option<MacAddr>,
+    /// Largest IP packet the path from this interface to the backends
+    /// carries. Packets that would not fit once encapsulated are answered with
+    /// ICMP "too big". Defaults to the interface's MTU.
+    #[serde(default)]
+    pub mtu: Option<u16>,
     #[serde(default)]
     pub mode: XdpMode,
 }
+
+/// Smallest `xdp.mtu`: every IPv4 host takes 576-byte packets (RFC 791), so a
+/// lower value would ask clients for packets they may not be able to send.
+pub const MIN_XDP_MTU: u16 = 576;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -280,6 +289,11 @@ impl Config {
                     );
                 }
             }
+        }
+        if let Some(mtu) = self.xdp.as_ref().and_then(|xdp| xdp.mtu)
+            && mtu < MIN_XDP_MTU
+        {
+            bail!("xdp.mtu must be at least {MIN_XDP_MTU}, got {mtu}");
         }
         Ok(())
     }
@@ -554,6 +568,17 @@ listeners:
                 error(&XDP.replace("10.0.3.3:80", "\"[fd00::3]:80\""))
                     .contains("VIP's address family")
             );
+            let mtu = |value: &str| {
+                XDP.replace(
+                    "  interface: eth0\n",
+                    &format!("  interface: eth0\n  mtu: {value}\n"),
+                )
+            };
+            assert_eq!(
+                Config::parse(&mtu("1500")).unwrap().xdp.unwrap().mtu,
+                Some(1500)
+            );
+            assert!(error(&mtu("500")).contains("at least 576"));
         }
     }
 

@@ -76,6 +76,8 @@ struct Resolved {
     source_v4: Ipv4Addr,
     source_v6: Option<Ipv6Addr>,
     gateway_mac: MacAddr,
+    /// `None` if it could not be found: packets are then never checked.
+    mtu: Option<u16>,
 }
 
 impl DataPlane {
@@ -117,7 +119,7 @@ impl DataPlane {
                 source_v4: resolved.source_v4.octets(),
                 source_v6: resolved.source_v6.map_or([0; 16], |ip| ip.octets()),
                 gateway_mac: resolved.gateway_mac.0,
-                _pad: [0; 2],
+                mtu: resolved.mtu.unwrap_or(0),
             },
             0,
         )?;
@@ -138,6 +140,7 @@ impl DataPlane {
             source = %resolved.source_v4,
             source_v6 = %resolved.source_v6.map_or("none".to_owned(), |ip| ip.to_string()),
             gateway = %resolved.gateway_mac,
+            mtu = %resolved.mtu.map_or("unchecked".to_owned(), |mtu| mtu.to_string()),
             "XDP data plane attached"
         );
         Ok(Self {
@@ -302,6 +305,7 @@ impl DataPlane {
                                 no_backend: sum.no_backend + cpu.no_backend,
                                 new_flows: sum.new_flows + cpu.new_flows,
                                 dropped: sum.dropped + cpu.dropped,
+                                too_big: sum.too_big + cpu.too_big,
                             })
                     })
                     .unwrap_or_default();
@@ -373,11 +377,39 @@ fn resolve(config: &XdpConfig) -> Result<Resolved> {
             )
         })?,
     };
+    let mtu = match config.mtu {
+        Some(mtu) => Some(mtu),
+        None => match interface_mtu(&config.interface) {
+            Ok(mtu) => Some(mtu),
+            Err(err) => {
+                warn!(
+                    interface = %config.interface,
+                    error = format!("{err:#}"),
+                    "could not read the interface MTU; packets too big to encapsulate will be dropped by the network card instead of answered with ICMP. Set xdp.mtu"
+                );
+                None
+            }
+        },
+    };
     Ok(Resolved {
         source_v4,
         source_v6: config.source_v6.or(ipv6),
         gateway_mac,
+        mtu,
     })
+}
+
+/// MTU of `interface`, from sysfs. Encapsulated packets leave through it, so
+/// it bounds what reaches the backends unless the path beyond is narrower.
+fn interface_mtu(interface: &str) -> Result<u16> {
+    let path = format!("/sys/class/net/{interface}/mtu");
+    let text = std::fs::read_to_string(&path).with_context(|| path.clone())?;
+    // Jumbo MTUs above 65535 cannot be reached by an IP packet anyway.
+    let mtu: u32 = text
+        .trim()
+        .parse()
+        .with_context(|| format!("{path}: {text:?}"))?;
+    Ok(mtu.min(u32::from(u16::MAX)) as u16)
 }
 
 /// The first IPv4 address and the first non-link-local IPv6 address of
@@ -643,7 +675,7 @@ impl Collector for XdpStats {
         let dataplane = self.dataplane.lock().expect("stats lock poisoned").clone();
         let rows = dataplane.map(|dp| dp.stats()).unwrap_or_default();
 
-        let series: [Series; 5] = [
+        let series: [Series; 6] = [
             (
                 "strait_xdp_packets",
                 "Packets sent to a backend by the XDP data plane",
@@ -663,6 +695,11 @@ impl Collector for XdpStats {
                 "strait_xdp_new_flows",
                 "Packets whose flow was not in the flow table and was placed by Maglev",
                 |s| s.new_flows,
+            ),
+            (
+                "strait_xdp_too_big",
+                "Packets too big to forward once encapsulated, answered with ICMP fragmentation needed or packet too big",
+                |s| s.too_big,
             ),
             (
                 "strait_xdp_dropped",
