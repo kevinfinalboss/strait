@@ -22,6 +22,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOGS="$ROOT/demo/.logs/xdp"
 STRAIT="$ROOT/target/release/strait"
+XDP_PASS="$ROOT/target/release/examples/xdp_pass"
 MODE=${MODE:-auto}
 VIP=10.10.0.10
 NS=(st-client st-router st-lb st-b1 st-b2)
@@ -87,6 +88,10 @@ up() {
 
     run st-client ip link set lo up
     run st-client ip route add default via 10.10.1.1
+    # veth leaves TCP checksums for "the hardware" to fill in and marks the
+    # packet instead. Native XDP drops that mark, so backends would see bad
+    # checksums. A real client's NIC fills them in before the wire.
+    run st-client ethtool -K c0 tx off >/dev/null
     run st-router sysctl -qw net.ipv4.ip_forward=1
     no_rp_filter st-router
     run st-router ip route add "$VIP/32" via 10.10.2.2
@@ -113,6 +118,11 @@ listeners:
     health_check:
       interval: 500ms
 EOF
+    # A veth only delivers XDP_TX frames to a peer that runs XDP itself. A NIC
+    # would not need this; on veth, without it, encapsulated packets vanish.
+    if [[ $MODE != generic ]]; then
+        run st-router "$XDP_PASS" r-l >"$LOGS/xdp_pass.log" 2>&1 &
+    fi
     run st-lb "$STRAIT" --config "$LOGS/strait.yaml" >"$LOGS/strait.log" 2>&1 &
     for _ in $(seq 50); do
         grep -q "XDP backends updated" "$LOGS/strait.log" 2>/dev/null && break
@@ -156,7 +166,12 @@ case ${1:-} in
     up) up ;;
     down) down ;;
     "")
-        cargo build --release --quiet --features xdp --manifest-path "$ROOT/Cargo.toml" 2>/dev/null
+        echo "building strait with the xdp feature (release)..."
+        if ! cargo build --release --quiet --features xdp --manifest-path "$ROOT/Cargo.toml" \
+            --bin strait --example xdp_pass 2>"$ROOT/demo/.logs/xdp-build.log"; then
+            cat "$ROOT/demo/.logs/xdp-build.log" >&2
+            exit 1
+        fi
         trap down EXIT
         up
         demo

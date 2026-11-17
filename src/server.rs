@@ -15,7 +15,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{Instrument, error, info, info_span};
 
 use crate::balancer::Pool;
-use crate::config::{Config, ListenerConfig};
+use crate::config::{Config, Dataplane, ListenerConfig};
 use crate::discovery;
 use crate::health::{self, HealthChecks};
 use crate::metrics::{BackendState, Metrics};
@@ -23,8 +23,8 @@ use crate::{Route, serve};
 
 /// All running listeners.
 ///
-/// Listeners are identified by their `listen` address: a reload that keeps an
-/// address updates that listener in place, even if its name changes.
+/// Listeners are identified by their `listen` address and data plane: a reload
+/// that keeps both updates that listener in place, even if its name changes.
 pub struct Server {
     listeners: Vec<Running>,
     metrics: Arc<Metrics>,
@@ -33,14 +33,36 @@ pub struct Server {
     kube: Option<Client>,
     /// Connection tasks of every listener, including removed ones.
     connections: TaskTracker,
+    /// Attached on the first config with an XDP listener; stays until shutdown.
+    #[cfg(feature = "xdp")]
+    xdp: Option<Arc<crate::xdp::DataPlane>>,
+    #[cfg(feature = "xdp")]
+    xdp_stats: crate::xdp::XdpStats,
 }
 
 struct Running {
     config: ListenerConfig,
     local_addr: SocketAddr,
     upstream: Arc<Upstream>,
-    accept: JoinHandle<()>,
+    /// Accept loop of a proxy listener.
+    accept: Option<JoinHandle<()>>,
     discovery: Option<JoinHandle<()>>,
+    /// VIP of an XDP listener; dropping it removes the VIP from the data plane.
+    #[cfg(feature = "xdp")]
+    _xdp: Option<crate::xdp::Binding>,
+}
+
+/// What receives a new listener's traffic.
+enum Frontend {
+    /// A bound socket and its actual address, for a proxy listener.
+    Socket(TcpListener, SocketAddr),
+    #[cfg(feature = "xdp")]
+    Xdp(Arc<crate::xdp::DataPlane>),
+}
+
+/// Whether `running` can be updated in place to `config`.
+fn same_listener(running: &ListenerConfig, config: &ListenerConfig) -> bool {
+    running.listen == config.listen && running.dataplane == config.dataplane
 }
 
 /// The parts of a listener that a reload or a discovery update can change.
@@ -82,6 +104,10 @@ impl Server {
             state: BackendState::default(),
             kube: None,
             connections: TaskTracker::new(),
+            #[cfg(feature = "xdp")]
+            xdp: None,
+            #[cfg(feature = "xdp")]
+            xdp_stats: crate::xdp::XdpStats::default(),
         };
         server.reload(config).await?;
         Ok(server)
@@ -92,7 +118,13 @@ impl Server {
         self.state.clone()
     }
 
-    /// Name and bound address of every running listener.
+    /// Prometheus counters of the XDP data plane; empty until it is attached.
+    #[cfg(feature = "xdp")]
+    pub fn xdp_stats(&self) -> crate::xdp::XdpStats {
+        self.xdp_stats.clone()
+    }
+
+    /// Name and bound address of every running listener (the VIP for XDP ones).
     pub fn local_addrs(&self) -> Vec<(String, SocketAddr)> {
         self.listeners
             .iter()
@@ -113,17 +145,45 @@ impl Server {
                 .context("could not connect to the Kubernetes API")?;
             self.kube = Some(client);
         }
+        let uses_xdp = config
+            .listeners
+            .iter()
+            .any(|l| l.dataplane == Dataplane::Xdp);
+        #[cfg(feature = "xdp")]
+        if uses_xdp {
+            let wanted = config
+                .xdp
+                .as_ref()
+                .expect("validated: xdp listeners need it");
+            match &self.xdp {
+                None => {
+                    let dataplane = crate::xdp::DataPlane::attach(wanted)?;
+                    let dataplane = Arc::new(dataplane);
+                    self.xdp_stats.set(Arc::clone(&dataplane));
+                    self.xdp = Some(dataplane);
+                }
+                Some(running) if running.config() != wanted => {
+                    tracing::warn!("xdp settings changed; restart strait to apply them");
+                }
+                Some(_) => {}
+            }
+        }
+        #[cfg(not(feature = "xdp"))]
+        debug_assert!(
+            !uses_xdp,
+            "validate rejects xdp listeners without the feature"
+        );
 
         // Bind every new address before touching anything, so a port that is
         // already taken aborts the reload with the old listeners still running.
         // Past this loop nothing can fail, so a reload applies fully or not at all.
         let mut bound = Vec::new();
         for listener in &config.listeners {
-            if !self
+            let kept = self
                 .listeners
                 .iter()
-                .any(|r| r.config.listen == listener.listen)
-            {
+                .any(|r| same_listener(&r.config, listener));
+            if !kept && listener.dataplane == Dataplane::Proxy {
                 let socket = TcpListener::bind(listener.listen).await.with_context(|| {
                     format!(
                         "listener {:?}: could not bind {}",
@@ -144,7 +204,7 @@ impl Server {
             let name = listener.name.clone();
             match previous
                 .iter()
-                .position(|r| r.config.listen == listener.listen)
+                .position(|r| same_listener(&r.config, listener))
             {
                 Some(index) => {
                     let mut running = previous.swap_remove(index);
@@ -157,15 +217,25 @@ impl Server {
                     self.listeners.push(running);
                 }
                 None => {
-                    let index = bound
-                        .iter()
-                        .position(|(addr, _, _)| *addr == listener.listen)
-                        .expect("every new address was bound above");
-                    let (_, socket, local_addr) = bound.swap_remove(index);
+                    let frontend = match listener.dataplane {
+                        Dataplane::Proxy => {
+                            let index = bound
+                                .iter()
+                                .position(|(addr, _, _)| *addr == listener.listen)
+                                .expect("every new proxy address was bound above");
+                            let (_, socket, local_addr) = bound.swap_remove(index);
+                            Frontend::Socket(socket, local_addr)
+                        }
+                        #[cfg(feature = "xdp")]
+                        Dataplane::Xdp => {
+                            Frontend::Xdp(Arc::clone(self.xdp.as_ref().expect("attached above")))
+                        }
+                        #[cfg(not(feature = "xdp"))]
+                        Dataplane::Xdp => unreachable!("validate rejects xdp listeners"),
+                    };
                     self.listeners.push(Running::start(
                         listener.clone(),
-                        socket,
-                        local_addr,
+                        frontend,
                         &self.metrics,
                         &self.connections,
                         self.kube.as_ref(),
@@ -209,8 +279,7 @@ impl Server {
 impl Running {
     fn start(
         config: ListenerConfig,
-        socket: TcpListener,
-        local_addr: SocketAddr,
+        frontend: Frontend,
         metrics: &Arc<Metrics>,
         connections: &TaskTracker,
         kube: Option<&Client>,
@@ -220,26 +289,44 @@ impl Running {
             Arc::clone(metrics),
             connections.clone(),
         ));
+        let span = info_span!("listener", name = %config.name);
 
-        let accept = tokio::spawn({
-            let route = Arc::clone(&upstream.route);
-            let span = info_span!("listener", name = %config.name);
-            async move {
-                if let Err(err) = serve(socket, route).await {
-                    error!(error = %err, "listener stopped");
-                }
-            }
-            .instrument(span)
-        });
-        let discovery = start_discovery(&config, &upstream, kube);
-
-        Self {
-            config,
-            local_addr,
+        let mut running = Self {
+            local_addr: config.listen,
+            discovery: start_discovery(&config, &upstream, kube),
             upstream,
-            accept,
-            discovery,
+            accept: None,
+            #[cfg(feature = "xdp")]
+            _xdp: None,
+            config,
+        };
+        match frontend {
+            Frontend::Socket(socket, local_addr) => {
+                let route = Arc::clone(&running.upstream.route);
+                running.local_addr = local_addr;
+                running.accept = Some(tokio::spawn(
+                    async move {
+                        if let Err(err) = serve(socket, route).await {
+                            error!(error = %err, "listener stopped");
+                        }
+                    }
+                    .instrument(span),
+                ));
+            }
+            #[cfg(feature = "xdp")]
+            Frontend::Xdp(dataplane) => {
+                let std::net::SocketAddr::V4(vip) = running.config.listen else {
+                    unreachable!("validate requires an IPv4 VIP");
+                };
+                running._xdp = Some(crate::xdp::Binding::start(
+                    dataplane,
+                    vip,
+                    Arc::clone(&running.upstream.route),
+                    span,
+                ));
+            }
         }
+        running
     }
 
     /// Applies new settings in place. Backends that stay keep their state.
@@ -278,7 +365,9 @@ fn start_discovery(
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.accept.abort();
+        if let Some(task) = &self.accept {
+            task.abort();
+        }
         if let Some(task) = &self.discovery {
             task.abort();
         }

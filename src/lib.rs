@@ -12,6 +12,8 @@ pub mod maglev;
 mod metrics;
 mod relay;
 mod server;
+#[cfg(feature = "xdp")]
+pub mod xdp;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -29,7 +31,8 @@ pub use balancer::{
     Algorithm, Backend, Candidates, IpHash, Lease, LeastConnections, Pool, RoundRobin, Strategy,
 };
 pub use config::{
-    Config, HealthCheckConfig, KubernetesBackends, ListenerConfig, MetricsConfig, ServicePort,
+    Config, Dataplane, HealthCheckConfig, KubernetesBackends, ListenerConfig, MacAddr,
+    MetricsConfig, ServicePort, XdpConfig, XdpMode,
 };
 pub use health::{HealthCheck, HealthChecks, spawn as spawn_health_checks};
 pub use metrics::{

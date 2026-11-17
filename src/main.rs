@@ -93,6 +93,7 @@ impl Args {
             listeners: vec![ListenerConfig {
                 name: "default".into(),
                 listen: self.listen,
+                dataplane: strait::Dataplane::Proxy,
                 backends: self.backends.clone(),
                 kubernetes: None,
                 strategy: self.strategy,
@@ -106,6 +107,7 @@ impl Args {
                 },
             }],
             metrics: None,
+            xdp: None,
         };
         config.validate()?;
         Ok(config)
@@ -132,6 +134,8 @@ async fn main() -> Result<()> {
         let mut registry = Registry::default();
         metrics.register(&mut registry);
         registry.register_collector(Box::new(server.backend_state()));
+        #[cfg(feature = "xdp")]
+        registry.register_collector(Box::new(server.xdp_stats()));
         let socket = TcpListener::bind(listen)
             .await
             .with_context(|| format!("could not bind metrics endpoint {listen}"))?;
