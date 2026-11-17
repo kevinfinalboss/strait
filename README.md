@@ -47,6 +47,12 @@ strait keeps clients away from broken backends in three ways:
 - **Retries.** If connecting to the chosen backend fails or takes longer than `--connect-timeout`, strait tries up to `--retries` other backends before giving up. This covers the window between a backend going down and the health check noticing.
 - **Idle timeout.** Connections with no traffic in either direction for `--idle-timeout` are closed, so stuck clients do not hold backend connections forever. This includes a client that stops reading: once its socket buffer is full and no byte moves, the timeout fires. Each direction is copied independently, so one side stalling never blocks the other, and TCP half-close is preserved: when one side finishes sending, the other direction keeps flowing.
 
+### Client address
+
+A backend behind strait sees strait's address, not the client's. With `proxy_protocol: v2` on a listener (or `--proxy-protocol v2`), strait sends a [PROXY protocol v2](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt) header on each backend connection before any client byte, carrying the client's address and port and the address it connected to. nginx (`listen ... proxy_protocol`), HAProxy (`accept-proxy`), Envoy and many servers read it.
+
+Turn it on only for backends that expect it: a backend that does not will take the header for the start of the client's data. Health checks connect and close without sending anything, so they work with such backends unchanged. With `dataplane: xdp` the option is rejected, since backends already see the client's address there.
+
 ### Shutdown
 
 On `SIGTERM` (how Kubernetes stops a pod) or Ctrl-C, strait closes its listeners and waits up to `--shutdown-timeout` (default `20s`) for open connections to finish, then cuts the rest and exits. A second signal skips the wait.
@@ -221,7 +227,7 @@ Each column is a pod; at second 15 four of the five pods leave and their traffic
 
 ## XDP data plane
 
-> Experimental. Linux only, IPv4 and TCP only, and not yet benchmarked against the proxy.
+> Experimental. Linux only, and not yet benchmarked against the proxy. TCP and UDP, over IPv4 or IPv6.
 
 With `dataplane: xdp`, a listener stops being a proxy. strait loads an [XDP](https://docs.kernel.org/networking/af_xdp.html) program, written in Rust with [Aya](https://aya-rs.dev), onto a network interface. The program balances packets in the driver, before the kernel allocates anything for them:
 
@@ -238,10 +244,12 @@ flowchart LR
 
 1. A packet to the VIP (the listener's `listen` address) reaches the strait host.
 2. The program hashes the flow's 5-tuple and looks up its backend in the VIP's [Maglev](https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/) table.
-3. It wraps the packet in an outer IPv4 header addressed to that backend (IP-in-IP), points it at the gateway and sends it back out of the same interface (`XDP_TX`).
+3. It wraps the packet in an outer header addressed to that backend (IP-in-IP for IPv4, IPv6-in-IPv6 for IPv6), points it at the gateway and sends it back out of the same interface (`XDP_TX`).
 4. The backend unwraps it and answers the client directly (direct server return). Replies never pass through strait, which only ever sees the client's side of each flow.
 
-There is no connection tracking. A flow stays on its backend because its hash and the table stay the same. Maglev keeps changes small: when a backend joins or leaves, only a few percent of other flows move, against nearly all of them with `hash % backends`.
+If the packet would no longer fit the path's MTU with the outer header added, strait does not forward it. It answers the client with an ICMP "fragmentation needed" (IPv4) or "packet too big" (IPv6) error from the VIP instead, and the client's path MTU discovery sends smaller packets from then on.
+
+A flow's first packet picks its backend from the Maglev table, and the choice is remembered in an LRU flow table (262,144 flows), so the flow stays on that backend even when the table changes. A remembered backend that left the listener is not reused: its flows go back to the table. Maglev keeps changes small for flows that are not remembered: when a backend joins or leaves, only a few percent of them move, against nearly all of them with `hash % backends`.
 
 The control plane is the same as for the proxy. Static or Kubernetes backends, health checks and the `strait_backend_*` gauges all work unchanged. Every 500ms, strait compares each XDP listener's healthy backends with its table and rewrites only the slots that changed.
 
@@ -250,15 +258,27 @@ The control plane is the same as for the proxy. Static or Kubernetes backends, h
 ```yaml
 xdp:
   interface: eth0              # where VIP traffic arrives
-  source: 10.0.2.2             # outer source address, usually the interface's own
+  # Optional: by default, the interface's first IPv4 / global IPv6 address
+  # and the MAC of its IPv4 default gateway.
+  source: 10.0.2.2             # outer source address for IPv4 backends
+  source_v6: "fd00::2"         # outer source address for IPv6 backends
   gateway_mac: "aa:bb:cc:dd:ee:ff"  # next hop that routes to the backends
+  mtu: 1500                    # largest packet the path to the backends carries
   mode: auto                   # auto | native | generic
 
 listeners:
   - name: web
     listen: 10.0.0.10:80       # the VIP; not bound to a socket
     dataplane: xdp
-    backends: [10.0.3.2:80, 10.0.3.3:80]   # same port as the VIP
+    backends: [10.0.3.2:80, 10.0.3.3:80]   # same port and family as the VIP
+
+  - name: dns
+    listen: 10.0.0.10:53
+    dataplane: xdp
+    protocol: udp              # tcp (default) or udp
+    backends: [10.0.3.2:53, 10.0.3.3:53]
+    health_check:
+      port: 8053               # health checks are TCP connects
 ```
 
 Backends need the VIP on a local interface and an IP-in-IP tunnel that accepts packets from any source:
@@ -272,9 +292,11 @@ sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.ipip0.rp_filter=0
 Things to know:
 
 - **Root required.** strait needs root, or `CAP_BPF` and `CAP_NET_ADMIN`, to load the program.
-- **Room for the outer header.** Encapsulation adds 20 bytes, so links between strait and the backends need an MTU 20 bytes larger than the clients' (or clients need a smaller MSS).
+- **Same family and port as the VIP.** Packets keep their destination port and travel inside a header of their own family, so every backend must use the VIP's port and address family. The config rejects static backends that do not; Kubernetes backends that do not (a dual-stack Service, or a `targetPort` other than the VIP port) are left out with a warning in the log.
+- **Room for the outer header.** Encapsulation adds 20 bytes for IPv4 and 40 for IPv6. A packet that no longer fits `xdp.mtu` (by default the interface's MTU) is answered with ICMP, telling the client to send packets that much smaller. That keeps connections working, but costs a round trip and a retransmission per client and path; for full-size packets end to end, give the links between strait and the backends an MTU 20 or 40 bytes larger than the clients'. Set `xdp.mtu` lower than the interface's if a link further along the path is narrower. ICMP has to reach the clients for this to work: a firewall that drops it brings back stalled connections, and clamping the MSS on the backends avoids depending on it for TCP.
+- **Some packets go to the kernel instead.** IPv4 packets with options, IP fragments and IPv6 packets with extension headers are not balanced: the program hands them to the kernel as usual, which does not know the VIP. Clients rarely send them, but tunnels and some VPNs do.
 - **Changing the `xdp` section needs a restart.** Listeners can be added, changed and removed with a reload, like proxy listeners. Up to 16 XDP listeners.
-- **Prometheus counters.** `strait_xdp_packets_total`, `strait_xdp_bytes_total` and `strait_xdp_no_backend_total` count per listener what the program forwarded or dropped.
+- **Prometheus counters.** Per listener: `strait_xdp_packets_total` and `strait_xdp_bytes_total` count what the program forwarded, `strait_xdp_new_flows_total` the packets placed by Maglev rather than the flow table, `strait_xdp_too_big_total` the packets answered with ICMP because they did not fit the MTU, `strait_xdp_no_backend_total` the drops because the listener had no backend, and `strait_xdp_dropped_total` every other drop (a backend of the wrong family, or no room for the outer header).
 
 ### Building
 
@@ -304,6 +326,12 @@ $ demo/xdp.sh
 == the load balancer never sees a reply: it only counts client packets
 strait_xdp_packets_total{listener="web"} 210
 strait_xdp_no_backend_total{listener="web"} 0
+
+== the client's link grows to 3000 bytes, as large as the load balancer's:
+   its packets no longer fit once encapsulated, so strait answers them
+   with ICMP and the client lowers its path MTU by the 20 bytes of IP-in-IP
+mtu 2980
+strait_xdp_too_big_total{listener="web"} 10
 ```
 
 The demo needs two workarounds that real network cards do not, both specific to veth pairs:
@@ -402,6 +430,7 @@ Options:
       --connect-timeout <DURATION>       Maximum time to connect to a backend [default: 3s]
       --idle-timeout <DURATION>          Close connections with no traffic for this long [default: 5m]
       --retries <RETRIES>                Other backends to try when a connection to the chosen one fails [default: 2]
+      --proxy-protocol <VERSION>         Send backends a PROXY protocol header with the client's address [possible values: v2]
       --health-interval <DURATION>       Time between health checks of each backend [default: 5s]
       --health-timeout <DURATION>        Maximum time a health check may take [default: 1s]
       --watch-config                     Reload automatically when the config file changes, including a mounted ConfigMap
