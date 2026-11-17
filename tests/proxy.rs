@@ -29,7 +29,7 @@ async fn spawn_echo_backend() -> SocketAddr {
 async fn spawn_strait(backend: SocketAddr) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let pool = Pool::new([backend], Algorithm::RoundRobin).unwrap();
+    let pool = Pool::new([backend], Algorithm::RoundRobin);
     tokio::spawn(strait::run(
         listener,
         Arc::new(pool),

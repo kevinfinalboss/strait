@@ -76,7 +76,7 @@ fn fast_health_checks() -> HealthCheck {
 #[tokio::test]
 async fn retries_on_another_backend_when_connect_fails() {
     let backends = [dead_addr().await, spawn_named_backend("b").await];
-    let pool = Arc::new(Pool::new(backends, Algorithm::RoundRobin).unwrap());
+    let pool = Arc::new(Pool::new(backends, Algorithm::RoundRobin));
     let proxy = spawn_strait(pool, ProxyConfig::default()).await;
 
     // Round-robin sends every other connection to the dead backend first.
@@ -92,7 +92,7 @@ async fn health_checks_remove_and_restore_a_backend() {
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
-    let pool = Arc::new(Pool::new([addr], Algorithm::RoundRobin).unwrap());
+    let pool = Arc::new(Pool::new([addr], Algorithm::RoundRobin));
     let _checks = strait::spawn_health_checks(&pool, fast_health_checks());
     let backend = Arc::clone(&pool.backends()[0]);
 
@@ -106,7 +106,7 @@ async fn health_checks_remove_and_restore_a_backend() {
 #[tokio::test]
 async fn unhealthy_backend_gets_no_traffic() {
     let backends = [dead_addr().await, spawn_named_backend("b").await];
-    let pool = Arc::new(Pool::new(backends, Algorithm::RoundRobin).unwrap());
+    let pool = Arc::new(Pool::new(backends, Algorithm::RoundRobin));
     let _checks = strait::spawn_health_checks(&pool, fast_health_checks());
 
     let dead = Arc::clone(&pool.backends()[0]);
@@ -128,7 +128,7 @@ async fn unhealthy_backend_gets_no_traffic() {
 #[tokio::test]
 async fn idle_connections_are_closed() {
     let backend = spawn_named_backend("a").await;
-    let pool = Arc::new(Pool::new([backend], Algorithm::RoundRobin).unwrap());
+    let pool = Arc::new(Pool::new([backend], Algorithm::RoundRobin));
     let config = ProxyConfig {
         idle_timeout: Duration::from_millis(100),
         ..ProxyConfig::default()
@@ -150,7 +150,7 @@ async fn idle_connections_are_closed() {
 #[tokio::test]
 async fn active_connections_are_not_closed() {
     let backend = spawn_named_backend("a").await;
-    let pool = Arc::new(Pool::new([backend], Algorithm::RoundRobin).unwrap());
+    let pool = Arc::new(Pool::new([backend], Algorithm::RoundRobin));
     let config = ProxyConfig {
         idle_timeout: Duration::from_millis(200),
         ..ProxyConfig::default()
@@ -174,11 +174,36 @@ async fn active_connections_are_not_closed() {
 
 #[tokio::test]
 async fn dropping_health_checks_stops_them() {
-    let pool = Arc::new(Pool::new([dead_addr().await], Algorithm::RoundRobin).unwrap());
+    let pool = Arc::new(Pool::new([dead_addr().await], Algorithm::RoundRobin));
     let checks = strait::spawn_health_checks(&pool, fast_health_checks());
     drop(checks);
 
     // Running checks would mark the dead backend unhealthy within ~40ms.
     sleep(Duration::from_millis(200)).await;
     assert!(pool.backends()[0].is_healthy());
+}
+
+#[tokio::test]
+async fn idle_timeout_closes_a_client_that_stops_reading() {
+    // A backend that sends as fast as it can, to a client that never reads: the
+    // proxy's write to the client blocks once the socket buffers fill up.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let chunk = vec![0u8; 64 * 1024];
+        while socket.write_all(&chunk).await.is_ok() {}
+    });
+
+    let pool = Arc::new(Pool::new([backend], Algorithm::RoundRobin));
+    let config = ProxyConfig {
+        idle_timeout: Duration::from_millis(200),
+        ..ProxyConfig::default()
+    };
+    let proxy = spawn_strait(Arc::clone(&pool), config).await;
+    let _client = TcpStream::connect(proxy).await.unwrap();
+
+    let backend = &pool.backends()[0];
+    eventually(|| backend.active_connections() == 1).await;
+    eventually(|| backend.active_connections() == 0).await;
 }
