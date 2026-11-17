@@ -32,7 +32,7 @@ pub use balancer::{
 };
 pub use config::{
     Config, Dataplane, HealthCheckConfig, KubernetesBackends, ListenerConfig, MacAddr,
-    MetricsConfig, ServicePort, XdpConfig, XdpMode,
+    MetricsConfig, Protocol, ServicePort, XdpConfig, XdpMode,
 };
 pub use health::{HealthCheck, HealthChecks, spawn as spawn_health_checks};
 pub use metrics::{
