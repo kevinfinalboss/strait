@@ -28,6 +28,16 @@ config:
 # change rolls the Deployment instead.
 watchConfig: true
 
+# How a pod stops. Kubernetes first runs the preStop sleep while the pod leaves
+# the Service endpoints, then sends SIGTERM: strait stops accepting and gives
+# open connections drainTimeout to finish. preStopSleepSeconds + drainTimeout
+# must fit in terminationGracePeriodSeconds, or the kubelet kills the pod first.
+shutdown:
+  # Built-in sleep action, Kubernetes 1.30 or later; 0 disables it.
+  preStopSleepSeconds: 5
+  drainTimeout: 20s
+  terminationGracePeriodSeconds: 30
+
 serviceAccount:
   create: true
   # Defaults to the release fullname.

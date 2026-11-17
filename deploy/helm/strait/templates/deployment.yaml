@@ -32,6 +32,7 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.shutdown.terminationGracePeriodSeconds }}
       containers:
         - name: strait
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -42,6 +43,16 @@ spec:
             {{- if .Values.watchConfig }}
             - --watch-config
             {{- end }}
+            - --shutdown-timeout
+            - {{ .Values.shutdown.drainTimeout | quote }}
+          {{- if .Values.shutdown.preStopSleepSeconds }}
+          lifecycle:
+            # Keeps accepting while the endpoint removal reaches every node;
+            # the image has no shell, so this uses the built-in sleep action.
+            preStop:
+              sleep:
+                seconds: {{ .Values.shutdown.preStopSleepSeconds }}
+          {{- end }}
           ports:
             {{- range .Values.config.listeners }}
             - name: {{ include "strait.portName" .name }}
