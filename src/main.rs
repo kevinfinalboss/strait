@@ -94,6 +94,7 @@ impl Args {
                 name: "default".into(),
                 listen: self.listen,
                 dataplane: strait::Dataplane::Proxy,
+                protocol: strait::Protocol::Tcp,
                 backends: self.backends.clone(),
                 kubernetes: None,
                 strategy: self.strategy,
