@@ -246,7 +246,9 @@ impl Config {
                     );
                 }
                 if self.xdp.is_none() {
-                    bail!("listener {name:?} uses dataplane: xdp, which needs the top-level xdp section");
+                    bail!(
+                        "listener {name:?} uses dataplane: xdp, which needs the top-level xdp section"
+                    );
                 }
             }
         }
@@ -487,13 +489,22 @@ listeners:
 
     #[test]
     fn checks_xdp_listeners() {
-        let without_section = XDP.replace("xdp:\n  interface: eth0\n  source: 10.0.2.2\n  gateway_mac: AA:bb:cc:00:11:22\n", "");
+        let without_section = XDP.replace(
+            "xdp:\n  interface: eth0\n  source: 10.0.2.2\n  gateway_mac: AA:bb:cc:00:11:22\n",
+            "",
+        );
         assert!(error(&without_section).contains("xdp"));
         assert!(error(&XDP.replace("AA:bb", "AA:zz")).contains("invalid MAC address"));
-        assert!(error(&XDP.replace("AA:bb:cc:00:11:22", "aa:bb:cc:00:11")).contains("invalid MAC address"));
+        assert!(
+            error(&XDP.replace("AA:bb:cc:00:11:22", "aa:bb:cc:00:11"))
+                .contains("invalid MAC address")
+        );
         if cfg!(feature = "xdp") {
             assert!(error(&XDP.replace("10.0.3.3:80", "10.0.3.3:8080")).contains("VIP port 80"));
-            assert!(error(&XDP.replace("listen: 10.0.0.10:80", "listen: 0.0.0.0:80")).contains("IPv4 listen address"));
+            assert!(
+                error(&XDP.replace("listen: 10.0.0.10:80", "listen: 0.0.0.0:80"))
+                    .contains("IPv4 listen address")
+            );
         }
     }
 
