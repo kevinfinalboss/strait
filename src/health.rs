@@ -15,6 +15,10 @@ use crate::balancer::{Backend, Pool};
 /// How backends are probed and how many results it takes to change their state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthCheck {
+    /// Off means no probes: every backend stays healthy.
+    pub enabled: bool,
+    /// Port to probe instead of the backend's own.
+    pub port: Option<u16>,
     /// Time between two probes of the same backend.
     pub interval: Duration,
     /// How long a probe may take before it counts as a failure.
@@ -28,6 +32,8 @@ pub struct HealthCheck {
 impl Default for HealthCheck {
     fn default() -> Self {
         Self {
+            enabled: true,
+            port: None,
             interval: Duration::from_secs(5),
             timeout: Duration::from_secs(1),
             unhealthy_threshold: 2,
@@ -70,6 +76,15 @@ impl HealthChecks {
             self.config = config;
         }
 
+        if !config.enabled {
+            // Without checks nothing would ever mark a backend healthy again.
+            self.tasks.clear();
+            for backend in pool.backends() {
+                backend.set_healthy(true);
+            }
+            return;
+        }
+
         let mut previous = std::mem::take(&mut self.tasks);
         for backend in pool.backends() {
             let probing = match previous.remove(&backend.addr()) {
@@ -108,7 +123,7 @@ async fn watch(backend: Arc<Backend>, config: HealthCheck) {
     loop {
         ticker.tick().await;
 
-        if probe(&backend, config.timeout).await {
+        if probe(&backend, config.port, config.timeout).await {
             successes += 1;
             failures = 0;
             if successes >= config.healthy_threshold && !backend.set_healthy(true) {
@@ -124,10 +139,12 @@ async fn watch(backend: Arc<Backend>, config: HealthCheck) {
     }
 }
 
-/// A backend passes when a TCP connection to it succeeds within `limit`.
-async fn probe(backend: &Backend, limit: Duration) -> bool {
-    matches!(
-        timeout(limit, TcpStream::connect(backend.addr())).await,
-        Ok(Ok(_))
-    )
+/// A backend passes when a TCP connection to it (or to `port` on its
+/// address) succeeds within `limit`.
+async fn probe(backend: &Backend, port: Option<u16>, limit: Duration) -> bool {
+    let mut addr = backend.addr();
+    if let Some(port) = port {
+        addr.set_port(port);
+    }
+    matches!(timeout(limit, TcpStream::connect(addr)).await, Ok(Ok(_)))
 }
