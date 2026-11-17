@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>strait · Layer 4 load balancer in Rust</title>
+<meta name="description" content="strait is a Layer 4 load balancer written in Rust: health checks, hot reload, Prometheus metrics, Kubernetes discovery and an experimental XDP data plane with Maglev hashing.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --surface-2: #eef1f5;
+  --text: #14171c;
+  --muted: #5b6472;
+  --border: #dde2ea;
+  --accent: #0f7b8a;
+  --accent-2: #e8f4f6;
+  --accent-text: #0b5f6b;
+  --flow: #0f7b8a;
+  --flow-alt: #b45309;
+  --code-bg: #1e2229;
+  --code-text: #dcdfe4;
+  --shadow: 0 1px 2px rgba(16,24,40,.04), 0 8px 24px rgba(16,24,40,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1116;
+    --surface: #161a21;
+    --surface-2: #1d222b;
+    --text: #e8ebf0;
+    --muted: #9aa3b2;
+    --border: #2a303b;
+    --accent: #3cc1d1;
+    --accent-2: #12313a;
+    --accent-text: #7fdbe6;
+    --flow: #3cc1d1;
+    --flow-alt: #f0a24a;
+    --code-bg: #0b0d11;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1116;
+  --surface: #161a21;
+  --surface-2: #1d222b;
+  --text: #e8ebf0;
+  --muted: #9aa3b2;
+  --border: #2a303b;
+  --accent: #3cc1d1;
+  --accent-2: #12313a;
+  --accent-text: #7fdbe6;
+  --flow: #3cc1d1;
+  --flow-alt: #f0a24a;
+  --code-bg: #0b0d11;
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.6 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre { font-family: "JetBrains Mono", ui-monospace, monospace; }
+code { white-space: nowrap; font-size: .9em; background: var(--surface-2); padding: .1em .35em; border-radius: 5px; }
+
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 16px; }
+
+nav.top {
+  position: sticky; top: 0; z-index: 10;
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--border);
+}
+nav.top .wrap { display: flex; align-items: center; gap: 24px; height: 58px; }
+.brand { font-weight: 800; font-size: 19px; color: var(--text); letter-spacing: -.02em; }
+.brand span { color: var(--accent); }
+nav.top .links { display: flex; gap: 20px; margin-left: auto; font-size: 14.5px; }
+nav.top .links a { color: var(--muted); }
+nav.top .links a:hover { color: var(--text); text-decoration: none; }
+@media (max-width: 720px) { nav.top .links .opt { display: none; } }
+
+header.hero { padding: 72px 0 40px; }
+.eyebrow {
+  display: inline-block; font-size: 13px; font-weight: 600; letter-spacing: .04em;
+  color: var(--accent-text); background: var(--accent-2); padding: 4px 10px; border-radius: 999px;
+}
+h1 { font-size: clamp(36px, 6vw, 60px); line-height: 1.05; letter-spacing: -.035em; margin: 18px 0 16px; font-weight: 800; }
+.lede { font-size: clamp(17px, 2.2vw, 20px); color: var(--muted); max-width: 680px; margin: 0 0 28px; }
+.actions { display: flex; flex-wrap: wrap; gap: 12px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px; padding: 11px 18px; border-radius: 10px;
+  font-weight: 600; font-size: 15px; border: 1px solid var(--border); color: var(--text); background: var(--surface);
+}
+.btn:hover { text-decoration: none; border-color: var(--accent); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+:root[data-theme="dark"] .btn.primary { color: #06262b; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .btn.primary { color: #06262b; } }
+
+.hero-shot { margin-top: 44px; }
+.hero-shot img { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+
+section { padding: 56px 0; }
+section + section { border-top: 1px solid var(--border); }
+h2 { font-size: clamp(26px, 3.6vw, 34px); letter-spacing: -.025em; margin: 0 0 10px; line-height: 1.15; }
+.sub { color: var(--muted); margin: 0 0 32px; max-width: 720px; }
+
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px;
+  box-shadow: var(--shadow);
+}
+.card h3 { margin: 0 0 6px; font-size: 17px; letter-spacing: -.01em; }
+.card p { margin: 0; color: var(--muted); font-size: 15px; }
+.card .tag { display: inline-block; font-size: 12px; font-weight: 600; color: var(--flow-alt); margin-bottom: 8px; }
+
+.diagrams { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); }
+.diagram { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 20px; box-shadow: var(--shadow); }
+.diagram h3 { margin: 0 0 4px; font-size: 17px; }
+.diagram p { margin: 0 0 12px; color: var(--muted); font-size: 14.5px; }
+.diagram svg { width: 100%; height: auto; display: block; }
+.diagram svg text { font-family: Inter, system-ui, sans-serif; fill: var(--text); }
+.diagram svg .muted { fill: var(--muted); }
+.diagram svg .node { fill: var(--surface-2); stroke: var(--border); }
+.diagram svg .node.hot { fill: var(--accent-2); stroke: var(--accent); }
+.diagram svg .flow { stroke: var(--flow); fill: none; stroke-width: 2; }
+.diagram svg .back { stroke: var(--flow-alt); fill: none; stroke-width: 2; stroke-dasharray: 6 5; }
+.diagram svg .head { fill: var(--flow); }
+.diagram svg .head-alt { fill: var(--flow-alt); }
+.legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px; font-size: 13px; color: var(--muted); }
+.legend i { display: inline-block; width: 18px; height: 0; border-top: 2px solid var(--flow); vertical-align: middle; margin-right: 6px; }
+.legend i.alt { border-top: 2px dashed var(--flow-alt); }
+
+.gallery { display: grid; gap: 28px; }
+figure { margin: 0; }
+figure .frame { background: var(--surface-2); border: 1px solid var(--border); border-radius: 16px; padding: 14px; overflow-x: auto; }
+figure img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+figcaption { margin-top: 10px; color: var(--muted); font-size: 15px; }
+figcaption strong { color: var(--text); }
+.two { display: grid; gap: 28px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 15px; background: var(--surface); border-radius: 12px; overflow: hidden; box-shadow: var(--shadow); }
+.table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid var(--border); }
+th, td { padding: 11px 14px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); background: var(--surface-2); font-weight: 600; }
+tr:last-child td { border-bottom: 0; }
+td.num { font-variant-numeric: tabular-nums; text-align: right; }
+th.num { text-align: right; }
+.note { color: var(--muted); font-size: 14px; margin-top: 12px; }
+
+pre.code {
+  background: var(--code-bg); color: var(--code-text); padding: 18px 20px; border-radius: 12px;
+  overflow-x: auto; font-size: 14px; line-height: 1.55; margin: 0;
+}
+pre.code .c { color: #7f848e; }
+pre.code .k { color: #98c379; }
+
+.roadmap { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+.roadmap li { display: flex; gap: 12px; align-items: baseline; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; }
+.roadmap .st { flex: none; font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 999px; }
+.st.done { background: var(--accent-2); color: var(--accent-text); }
+.st.wip { background: color-mix(in srgb, var(--flow-alt) 18%, transparent); color: var(--flow-alt); }
+.st.todo { background: var(--surface-2); color: var(--muted); }
+
+footer { padding: 36px 0 56px; color: var(--muted); font-size: 14px; border-top: 1px solid var(--border); }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 24px; justify-content: space-between; }
+
+.theme-toggle { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 8px; padding: 5px 9px; cursor: pointer; font: inherit; font-size: 13px; }
+.theme-toggle:hover { color: var(--text); border-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <a class="brand" href="#">strait<span>.</span></a>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a class="opt" href="#architecture">Architecture</a>
+      <a href="#screenshots">In action</a>
+      <a class="opt" href="#performance">Performance</a>
+      <a href="https://github.com/kevinfinalboss/strait">GitHub</a>
+      <button class="theme-toggle" id="theme" type="button" aria-label="Toggle color theme">◐</button>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow">Rust · Layer 4 · MIT</span>
+    <h1>Every connection<br>passes through.</h1>
+    <p class="lede">strait is a TCP load balancer written in Rust, built in stages from a plain proxy up to an in-kernel data plane. It has health checks, hot reload, Prometheus metrics and Kubernetes discovery, plus an experimental XDP mode with Maglev hashing and direct server return.</p>
+    <div class="actions">
+      <a class="btn primary" href="#quick-start">Quick start</a>
+      <a class="btn" href="https://github.com/kevinfinalboss/strait">View on GitHub →</a>
+    </div>
+    <div class="hero-shot"><a href="img/failover.png"><img src="img/failover.png" alt="Terminal showing strait's failover demo: per-second requests on backends a, b and c, with b dropping to zero at second 2 and returning at second 5" width="760" height="644"></a></div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="sub">Each feature arrived as a stage with its own tests and demo. Everything below runs today.</p>
+    <div class="grid">
+      <div class="card"><h3>Three strategies</h3><p>Round-robin, least connections, and <code>ip-hash</code> with rendezvous hashing: when a backend leaves, only its own clients move.</p></div>
+      <div class="card"><h3>Failure handling</h3><p>Active health checks with thresholds, connect retries on other backends, idle timeouts, and fail-open when every check fails.</p></div>
+      <div class="card"><h3>Hot reload</h3><p>A YAML config with many listeners, applied on <code>SIGHUP</code> or file change. A reload applies fully or not at all, and open connections keep their route.</p></div>
+      <div class="card"><h3>Prometheus metrics</h3><p>Connections, bytes as they move, connect and lifetime histograms, live per-backend gauges. Series of removed backends are cleaned up.</p></div>
+      <div class="card"><h3>Kubernetes native</h3><p>Backends from a Service's EndpointSlices, ConfigMap reload without restarts, a Helm chart, and graceful drain on <code>SIGTERM</code>.</p></div>
+      <div class="card"><span class="tag">EXPERIMENTAL</span><h3>XDP data plane</h3><p>An Aya program balances packets in the driver with Maglev tables and IP-in-IP. Backends answer clients directly; replies skip strait entirely.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <h2>Two data planes, one control plane</h2>
+    <p class="sub">Per listener, strait either proxies connections in userspace or programs the kernel to forward packets. Backend discovery, health checks and metrics are shared by both.</p>
+    <div class="diagrams">
+      <div class="diagram">
+        <h3>Proxy (default)</h3>
+        <p>strait accepts each TCP connection, picks a backend and relays bytes both ways on a tokio task.</p>
+        <svg viewBox="0 0 460 230" role="img" aria-label="Clients connect to strait, which opens a connection to one of two backends and relays traffic both ways">
+          <defs>
+            <marker id="p1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
+          </defs>
+          <rect class="node" x="10" y="40" width="96" height="40" rx="8"/><text x="58" y="65" text-anchor="middle" font-size="14">client</text>
+          <rect class="node" x="10" y="150" width="96" height="40" rx="8"/><text x="58" y="175" text-anchor="middle" font-size="14">client</text>
+          <rect class="node hot" x="182" y="85" width="104" height="60" rx="10"/><text x="234" y="112" text-anchor="middle" font-size="15" font-weight="700">strait</text><text class="muted" x="234" y="130" text-anchor="middle" font-size="12">:8080</text>
+          <rect class="node" x="354" y="40" width="96" height="40" rx="8"/><text x="402" y="65" text-anchor="middle" font-size="14">backend</text>
+          <rect class="node" x="354" y="150" width="96" height="40" rx="8"/><text x="402" y="175" text-anchor="middle" font-size="14">backend</text>
+          <path class="flow" d="M106,60 C140,60 150,100 180,108" marker-end="url(#p1)" marker-start="url(#p1)"/>
+          <path class="flow" d="M106,170 C140,170 150,130 180,122" marker-end="url(#p1)" marker-start="url(#p1)"/>
+          <path class="flow" d="M288,108 C318,100 326,60 352,60" marker-end="url(#p1)" marker-start="url(#p1)"/>
+          <path class="flow" d="M288,122 C318,130 326,170 352,170" marker-end="url(#p1)" marker-start="url(#p1)"/>
+          <text class="muted" x="234" y="215" text-anchor="middle" font-size="12">two TCP connections per client, bytes copied in userspace</text>
+        </svg>
+      </div>
+      <div class="diagram">
+        <h3>XDP with direct server return</h3>
+        <p>An XDP program picks a backend from a Maglev table, wraps the packet in IP-in-IP and sends it back out. The backend replies to the client directly.</p>
+        <svg viewBox="0 0 460 230" role="img" aria-label="Client packets go through a router to strait's XDP program, which encapsulates them to a backend; the backend replies directly to the client">
+          <defs>
+            <marker id="x1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
+            <marker id="x2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="head-alt" d="M0,0 L10,5 L0,10 z"/></marker>
+          </defs>
+          <rect class="node" x="10" y="95" width="86" height="40" rx="8"/><text x="53" y="120" text-anchor="middle" font-size="14">client</text>
+          <rect class="node" x="150" y="95" width="86" height="40" rx="8"/><text x="193" y="120" text-anchor="middle" font-size="14">router</text>
+          <rect class="node hot" x="132" y="8" width="122" height="52" rx="10"/><text x="193" y="31" text-anchor="middle" font-size="14" font-weight="700">strait · XDP</text><text class="muted" x="193" y="48" text-anchor="middle" font-size="11.5">Maglev + IP-in-IP</text>
+          <rect class="node" x="354" y="60" width="96" height="40" rx="8"/><text x="402" y="85" text-anchor="middle" font-size="14">backend</text>
+          <rect class="node" x="354" y="140" width="96" height="40" rx="8"/><text x="402" y="165" text-anchor="middle" font-size="14">backend</text>
+          <path class="flow" d="M96,115 L148,115" marker-end="url(#x1)"/>
+          <path class="flow" d="M178,95 L178,62" marker-end="url(#x1)"/>
+          <path class="flow" d="M208,62 L208,93" marker-end="url(#x1)"/>
+          <path class="flow" d="M236,110 C290,100 310,82 352,80" marker-end="url(#x1)"/>
+          <path class="flow" d="M236,122 C290,132 310,158 352,160" marker-end="url(#x1)"/>
+          <path class="back" d="M354,170 C250,210 120,210 60,137" marker-end="url(#x2)"/>
+          <text class="muted" x="300" y="224" text-anchor="middle" font-size="12">reply goes straight to the client</text>
+        </svg>
+        <div class="legend"><span><i></i>client to backend</span><span><i class="alt"></i>backend to client</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="screenshots">
+  <div class="wrap">
+    <h2>In action</h2>
+    <p class="sub">Output of the demos in the repository, captured from real runs on a laptop; long lines are wrapped and the log is trimmed to fit. Every scenario can be reproduced with <code>demo/run.sh</code> and <code>demo/xdp.sh</code>. Click an image for full size.</p>
+    <div class="gallery">
+      <figure><div class="frame"><a href="img/xdp.png"><img src="img/xdp.png" alt="Terminal output of demo/xdp.sh: requests split between backends b1 and b2, b1 taken out after it stops, and XDP counters" width="871" height="422" loading="lazy"></a></div><figcaption><strong>XDP data plane, end to end.</strong> Five network namespaces: client, router, strait with XDP in native mode, two backends. Requests to the VIP split across b1 and b2 by Maglev; when b1 stops, its health check takes it out of the table within a second. strait counted 210 packets, all client to server: the replies went straight back to the client.</figcaption></figure>
+      <figure><div class="frame"><a href="img/logs.png"><img src="img/logs.png" alt="strait log during a failover: refused connects retried on other backends, the backend marked unhealthy, then healthy again, then a graceful shutdown" width="864" height="320" loading="lazy"></a></div><figcaption><strong>Failover in strait's log.</strong> Backend b stops; the connects that hit it are retried on other backends until the health check removes it 350ms later. It comes back three seconds later, and on SIGTERM strait stops accepting and waits for open connections. (Span context trimmed for width.)</figcaption></figure>
+      <div class="two"><figure><div class="frame"><a href="img/least-conn.png"><img src="img/least-conn.png" alt="least-conn demo: round-robin caps throughput at 1155 requests per second with a slow backend, least-conn reaches 2399" width="760" height="867" loading="lazy"></a></div><figcaption><strong>Least connections vs. a slow replica.</strong> Backend c answers 50ms slower. Round-robin keeps giving it a third of the traffic and throughput drops to 1155 req/s; least-conn gives it 4% and doubles throughput.</figcaption></figure><figure><div class="frame"><a href="img/affinity.png"><img src="img/affinity.png" alt="ip-hash demo: 40 client IPs, backend c stopped halfway, only its 14 clients switch backend" width="760" height="786" loading="lazy"></a></div><figcaption><strong>Session affinity with rendezvous hashing.</strong> 40 client IPs on <code>ip-hash</code>. When backend c stops, exactly its 14 clients move; the other 26 keep their backend.</figcaption></figure></div>
+      <div class="two"><figure><div class="frame"><a href="img/reload.png"><img src="img/reload.png" alt="reload demo: at second 3 the config switches from backends a and b to b and c with zero errors" width="760" height="563" loading="lazy"></a></div><figcaption><strong>Hot reload with no errors.</strong> The config file switches from backends a and b to b and c and strait gets SIGHUP: a stops getting new connections and c starts in the same second.</figcaption></figure><figure><div class="frame"><a href="img/metrics.png"><img src="img/metrics.png" alt="Prometheus metrics: accepted connections, per-backend connections, backend_up gauges and error counters" width="925" height="280" loading="lazy"></a></div><figcaption><strong>Prometheus metrics.</strong> 200 connections split across two live backends; the third is down, so <code>strait_backend_up</code> is 0 and it gets no traffic.</figcaption></figure></div>
+      <div class="two"><figure><div class="frame"><a href="img/bench.png"><img src="img/bench.png" alt="Benchmark table comparing direct access and access through strait, keep-alive and new connection per request" width="760" height="300" loading="lazy"></a></div><figcaption><strong>Benchmark.</strong> <code>demo/bench.sh</code> on a Ryzen 7 5700G under WSL2: oha with 50 connections for 10 seconds per run.</figcaption></figure><figure><div class="frame"><a href="img/tests.png"><img src="img/tests.png" alt="cargo test output: every unit and integration test suite passing" width="760" height="482" loading="lazy"></a></div><figcaption><strong>Tests.</strong> Unit tests plus integration suites for proxying, balancing, resilience, reload, metrics and shutdown. The Kubernetes suite runs against a kind cluster on demand.</figcaption></figure></div>
+    </div>
+  </div>
+</section>
+
+<section id="performance">
+  <div class="wrap">
+    <h2>Performance</h2>
+    <p class="sub">The overhead strait adds over hitting the backend directly, measured with <a href="https://github.com/hatoo/oha">oha</a> using <code>demo/bench.sh</code>. CPU per request is strait's own CPU time, which is far less sensitive to other load on the machine than requests per second.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Run</th><th class="num">Requests/s</th><th class="num">p50</th><th class="num">p99</th><th class="num">CPU / request</th></tr></thead>
+<tbody>
+<tr><td>keep-alive, direct</td><td class="num">219,453</td><td class="num">0.17 ms</td><td class="num">0.93 ms</td><td class="num">17.6 µs</td></tr>
+<tr><td>keep-alive, via strait</td><td class="num">104,184</td><td class="num">0.42 ms</td><td class="num">1.37 ms</td><td class="num">38 µs</td></tr>
+<tr><td>new connection per request, direct</td><td class="num">64,012</td><td class="num">0.74 ms</td><td class="num">1.7 ms</td><td class="num">56.8 µs</td></tr>
+<tr><td>new connection per request, via strait</td><td class="num">34,681</td><td class="num">1.37 ms</td><td class="num">2.8 ms</td><td class="num">165.1 µs</td></tr>
+</tbody></table></div>
+<p class="note">50 connections for 10 s per run on an AMD Ryzen 7 5700G (16 threads) under WSL2, with the load generator, strait and the backend on the same machine. CPU per request is the backend's own CPU for direct runs and strait's for runs through it. A proxy that terminates TCP pays for two connections per client; the XDP data plane avoids that, and its benchmark is the next stage of the roadmap.</p>
+  </div>
+</section>
+
+<section id="quick-start">
+  <div class="wrap">
+    <h2>Quick start</h2>
+    <p class="sub">Requires Rust 1.95 or later. Any TCP service works as a backend; these serve HTTP.</p>
+<pre class="code"><span class="c"># build</span>
+git clone https://github.com/kevinfinalboss/strait.git && cd strait
+cargo build --release
+
+<span class="c"># two backends</span>
+python3 -m http.server 9001 --bind 127.0.0.1 &
+python3 -m http.server 9002 --bind 127.0.0.1 &
+
+<span class="c"># strait in front of them, with metrics</span>
+./target/release/strait -b 127.0.0.1:9001 -b 127.0.0.1:9002 --metrics 127.0.0.1:9090
+
+<span class="c"># requests alternate between the backends</span>
+curl http://127.0.0.1:8080/
+curl http://127.0.0.1:9090/metrics</pre>
+    <p class="note">The <a href="https://github.com/kevinfinalboss/strait#readme">README</a> covers the YAML config, Kubernetes and the Helm chart, the XDP build, and every flag.</p>
+  </div>
+</section>
+
+<section id="roadmap">
+  <div class="wrap">
+    <h2>Roadmap</h2>
+    <p class="sub">strait is built in stages, from a plain TCP proxy up to an XDP data plane.</p>
+    <ul class="roadmap">
+      <li><span class="st done">done</span><span><strong>TCP proxy</strong>: bidirectional copy, graceful shutdown</span></li>
+      <li><span class="st done">done</span><span><strong>Load balancing</strong>: round-robin and least connections</span></li>
+      <li><span class="st done">done</span><span><strong>Health checks</strong>, retries and timeouts</span></li>
+      <li><span class="st done">done</span><span><strong>Session affinity</strong> with rendezvous hashing</span></li>
+      <li><span class="st done">done</span><span><strong>Config file</strong> with multiple listeners and hot reload</span></li>
+      <li><span class="st done">done</span><span><strong>Prometheus metrics</strong></span></li>
+      <li><span class="st done">done</span><span><strong>Kubernetes</strong>: EndpointSlice discovery, ConfigMap reload, Helm chart</span></li>
+      <li><span class="st wip">in progress</span><span><strong>eBPF/XDP</strong>: the Maglev data plane works; benchmark against the proxy is next</span></li>
+      <li><span class="st todo">next</span><span><strong>Dashboards</strong>: Grafana dashboard and a compose stack with Prometheus</span></li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>strait · MIT license</span>
+    <span><a href="https://github.com/kevinfinalboss/strait">github.com/kevinfinalboss/strait</a></span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var key = "strait-theme";
+  try {
+    var saved = localStorage.getItem(key);
+    if (saved) root.setAttribute("data-theme", saved);
+  } catch (e) {}
+  document.getElementById("theme").addEventListener("click", function () {
+    var dark = root.getAttribute("data-theme")
+      ? root.getAttribute("data-theme") === "dark"
+      : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    var next = dark ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem(key, next); } catch (e) {}
+  });
+})();
+</script>
+</body>
+</html>
