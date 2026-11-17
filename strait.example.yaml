@@ -16,6 +16,7 @@ listeners:
     connect_timeout: 3s
     idle_timeout: 5m
     retries: 2
+    # proxy_protocol: v2  # send backends the client's address; off by default
     health_check:
       interval: 5s
       timeout: 1s
