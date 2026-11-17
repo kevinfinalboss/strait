@@ -121,6 +121,8 @@ pub struct Metrics {
     /// Live [`BackendMetrics`] by label set, so every route that uses a backend
     /// shares one handle and its series can be removed when the last one goes.
     live: Arc<Mutex<HashMap<BackendLabels, Weak<BackendMetrics>>>>,
+    /// Same as `live`, for listeners.
+    live_listeners: Arc<Mutex<HashMap<String, Weak<ListenerMetrics>>>>,
     pub accepted: Family<ListenerLabels, Counter>,
     pub backend_connections: Family<BackendLabels, Counter>,
     pub connect_failures: Family<ConnectFailureLabels, Counter>,
@@ -145,6 +147,7 @@ impl Default for Metrics {
     fn default() -> Self {
         Self {
             live: Arc::default(),
+            live_listeners: Arc::default(),
             accepted: Family::default(),
             backend_connections: Family::default(),
             connect_failures: Family::default(),
@@ -206,7 +209,16 @@ impl Metrics {
     }
 
     /// Handles for the per-listener series.
-    pub fn listener(&self, listener: &str) -> ListenerMetrics {
+    ///
+    /// Like [`backend`](Self::backend), returns the existing handles while
+    /// anything holds them, and the series leave the registry with the last one,
+    /// so a listener removed or renamed by a reload stops being exported.
+    pub fn listener(&self, listener: &str) -> Arc<ListenerMetrics> {
+        let mut live = self.live_listeners.lock().expect("metrics lock poisoned");
+        if let Some(existing) = live.get(listener).and_then(Weak::upgrade) {
+            return existing;
+        }
+
         let error = |reason| {
             self.connection_errors
                 .get_or_create(&ConnectionErrorLabels {
@@ -215,7 +227,7 @@ impl Metrics {
                 })
                 .clone()
         };
-        ListenerMetrics {
+        let handles = Arc::new(ListenerMetrics {
             accepted: self
                 .accepted
                 .get_or_create(&ListenerLabels {
@@ -224,6 +236,32 @@ impl Metrics {
                 .clone(),
             no_backend: error(ConnectionError::NoBackend),
             relay_errors: error(ConnectionError::Relay),
+            listener: listener.to_owned(),
+            metrics: self.clone(),
+        });
+        live.insert(listener.to_owned(), Arc::downgrade(&handles));
+        handles
+    }
+
+    /// Removes the series of `listener`; see [`forget`](Self::forget).
+    fn forget_listener(&self, listener: &str) {
+        let mut live = self.live_listeners.lock().expect("metrics lock poisoned");
+        if live
+            .get(listener)
+            .is_some_and(|weak| weak.strong_count() > 0)
+        {
+            return;
+        }
+        live.remove(listener);
+
+        self.accepted.remove(&ListenerLabels {
+            listener: listener.to_owned(),
+        });
+        for reason in [ConnectionError::NoBackend, ConnectionError::Relay] {
+            self.connection_errors.remove(&ConnectionErrorLabels {
+                listener: listener.to_owned(),
+                reason,
+            });
         }
     }
 
@@ -295,11 +333,21 @@ impl Metrics {
 }
 
 /// Series of one listener, looked up once so a connection only does atomic adds.
-#[derive(Debug, Clone)]
+/// Created by [`Metrics::listener`]; the series are removed when the last
+/// handle is dropped.
+#[derive(Debug)]
 pub struct ListenerMetrics {
     pub accepted: Counter,
     pub no_backend: Counter,
     pub relay_errors: Counter,
+    listener: String,
+    metrics: Metrics,
+}
+
+impl Drop for ListenerMetrics {
+    fn drop(&mut self) {
+        self.metrics.forget_listener(&self.listener);
+    }
 }
 
 /// Series of one backend of one listener, looked up once so a connection only

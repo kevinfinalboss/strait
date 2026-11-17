@@ -8,6 +8,7 @@ mod balancer;
 mod config;
 mod discovery;
 mod health;
+pub mod maglev;
 mod metrics;
 mod relay;
 mod server;
@@ -22,7 +23,7 @@ use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::task::TaskTracker;
-use tracing::{Instrument, info, info_span, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 pub use balancer::{
     Algorithm, Backend, Candidates, IpHash, Lease, LeastConnections, Pool, RoundRobin, Strategy,
@@ -66,7 +67,7 @@ pub struct Route {
     pub pool: Arc<Pool>,
     pub proxy: ProxyConfig,
     pub metrics: Arc<Metrics>,
-    listener_metrics: ListenerMetrics,
+    listener_metrics: Arc<ListenerMetrics>,
     /// Metric handles of every backend in `pool`, so connections never build labels.
     backend_metrics: HashMap<SocketAddr, Arc<BackendMetrics>>,
     /// Every connection task of the listener, so shutdown can wait for them.
@@ -167,7 +168,9 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, route: &Route) -> Resul
     client.set_nodelay(true)?;
     upstream.set_nodelay(true)?;
 
-    info!(%peer, %backend, "connection opened");
+    // Per-connection logs are debug: at info they would cost more than the
+    // proxying itself under load. Metrics cover the totals; failures are warn.
+    debug!(%peer, %backend, "connection opened");
 
     let result = relay(
         &mut client,
@@ -185,7 +188,7 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, route: &Route) -> Resul
         })
         .with_context(|| format!("relay to {backend} stopped"))?;
 
-    info!(
+    debug!(
         %peer,
         %backend,
         sent = transferred.sent,

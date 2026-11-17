@@ -229,6 +229,29 @@ async fn backends_removed_by_a_reload_leave_every_series_once_their_connections_
 }
 
 #[tokio::test]
+async fn a_renamed_listener_stops_exporting_its_old_name() {
+    let backend = spawn_echo_backend().await;
+    let mut harness = start(&[backend]).await;
+    let accepted =
+        |name: &str| format!(r#"strait_connections_accepted_total{{listener="{name}"}}"#);
+    assert_eq!(value(&scrape(&harness).await, &accepted("api")), Some(0.0));
+
+    // Same address, new name: the listener is updated in place.
+    let renamed = Config::parse(&format!(
+        "listeners:\n  - name: web\n    listen: 127.0.0.1:0\n    backends: [{backend}]\n"
+    ))
+    .unwrap();
+    harness.server.reload(&renamed).await.unwrap();
+
+    let body = scrape(&harness).await;
+    assert!(
+        !body.contains(r#"listener="api""#),
+        "series of the old name are still exported:\n{body}"
+    );
+    assert_eq!(value(&body, &accepted("web")), Some(0.0));
+}
+
+#[tokio::test]
 async fn serves_health_and_rejects_other_paths() {
     let harness = start(&[spawn_echo_backend().await]).await;
 
