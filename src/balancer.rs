@@ -5,7 +5,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use anyhow::{Result, bail};
 use clap::ValueEnum;
 use serde::Deserialize;
 
@@ -70,13 +69,42 @@ impl Drop for Lease {
     }
 }
 
+/// The backends a strategy may pick from for one connection.
+///
+/// A filtered view of the pool rather than a list, so choosing a backend does not
+/// allocate. Health flags can change while a strategy looks at them, so the view
+/// may shrink between two passes.
+#[derive(Debug, Clone, Copy)]
+pub struct Candidates<'a> {
+    backends: &'a [Arc<Backend>],
+    exclude: &'a [SocketAddr],
+    healthy_only: bool,
+}
+
+impl<'a> Candidates<'a> {
+    pub fn iter(self) -> impl Iterator<Item = &'a Arc<Backend>> + Clone {
+        let Self {
+            backends,
+            exclude,
+            healthy_only,
+        } = self;
+        backends.iter().filter(move |backend| {
+            !exclude.contains(&backend.addr) && (!healthy_only || backend.is_healthy())
+        })
+    }
+}
+
 /// Decides which backend receives the next connection.
 ///
 /// `Send + Sync` is required because one strategy is shared by every connection task.
 pub trait Strategy: Send + Sync {
-    /// Returns the index of the chosen backend for a connection from `client`.
-    /// `backends` is never empty.
-    fn choose(&self, backends: &[Arc<Backend>], client: SocketAddr) -> usize;
+    /// Returns the chosen backend for a connection from `client`, or `None` if
+    /// `candidates` turned out to be empty.
+    fn choose<'a>(
+        &self,
+        candidates: Candidates<'a>,
+        client: SocketAddr,
+    ) -> Option<&'a Arc<Backend>>;
 }
 
 /// Cycles through the backends in order.
@@ -86,8 +114,20 @@ pub struct RoundRobin {
 }
 
 impl Strategy for RoundRobin {
-    fn choose(&self, backends: &[Arc<Backend>], _client: SocketAddr) -> usize {
-        self.next.fetch_add(1, Ordering::Relaxed) % backends.len()
+    fn choose<'a>(
+        &self,
+        candidates: Candidates<'a>,
+        _client: SocketAddr,
+    ) -> Option<&'a Arc<Backend>> {
+        let count = candidates.iter().count();
+        if count == 0 {
+            return None;
+        }
+        let turn = self.next.fetch_add(1, Ordering::Relaxed) % count;
+        candidates
+            .iter()
+            .nth(turn)
+            .or_else(|| candidates.iter().next())
     }
 }
 
@@ -96,13 +136,14 @@ impl Strategy for RoundRobin {
 pub struct LeastConnections;
 
 impl Strategy for LeastConnections {
-    fn choose(&self, backends: &[Arc<Backend>], _client: SocketAddr) -> usize {
-        backends
+    fn choose<'a>(
+        &self,
+        candidates: Candidates<'a>,
+        _client: SocketAddr,
+    ) -> Option<&'a Arc<Backend>> {
+        candidates
             .iter()
-            .enumerate()
-            .min_by_key(|(_, backend)| backend.active_connections())
-            .map(|(index, _)| index)
-            .expect("backends is never empty")
+            .min_by_key(|backend| backend.active_connections())
     }
 }
 
@@ -127,13 +168,14 @@ impl IpHash {
 }
 
 impl Strategy for IpHash {
-    fn choose(&self, backends: &[Arc<Backend>], client: SocketAddr) -> usize {
-        backends
+    fn choose<'a>(
+        &self,
+        candidates: Candidates<'a>,
+        client: SocketAddr,
+    ) -> Option<&'a Arc<Backend>> {
+        candidates
             .iter()
-            .enumerate()
-            .max_by_key(|(_, backend)| Self::score(client.ip(), backend.addr()))
-            .map(|(index, _)| index)
-            .expect("backends is never empty")
+            .max_by_key(|backend| Self::score(client.ip(), backend.addr()))
     }
 }
 
@@ -163,7 +205,9 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub fn new(addrs: impl IntoIterator<Item = SocketAddr>, algorithm: Algorithm) -> Result<Self> {
+    /// An empty pool is valid: every lease returns `None` until backends appear,
+    /// which happens when a Kubernetes service has no ready pods.
+    pub fn new(addrs: impl IntoIterator<Item = SocketAddr>, algorithm: Algorithm) -> Self {
         Self::rebuild(None, addrs, algorithm)
     }
 
@@ -176,7 +220,7 @@ impl Pool {
         previous: Option<&Pool>,
         addrs: impl IntoIterator<Item = SocketAddr>,
         algorithm: Algorithm,
-    ) -> Result<Self> {
+    ) -> Self {
         let existing = |addr: SocketAddr| {
             previous?
                 .backends
@@ -189,14 +233,10 @@ impl Pool {
             .map(|addr| existing(addr).unwrap_or_else(|| Arc::new(Backend::new(addr))))
             .collect();
 
-        if backends.is_empty() {
-            bail!("at least one backend is required");
-        }
-
-        Ok(Self {
+        Self {
             backends,
             strategy: algorithm.strategy(),
-        })
+        }
     }
 
     /// Chooses a backend for a new connection from `client` and marks it as active.
@@ -206,30 +246,26 @@ impl Pool {
     /// backend is tried instead (fail open), since health checks can be wrong.
     /// Returns `None` when every backend is excluded.
     pub fn lease(&self, client: SocketAddr, exclude: &[SocketAddr]) -> Option<Lease> {
-        let remaining: Vec<_> = self
-            .backends
-            .iter()
-            .filter(|backend| !exclude.contains(&backend.addr))
-            .cloned()
-            .collect();
-
-        let healthy: Vec<_> = remaining
-            .iter()
-            .filter(|backend| backend.is_healthy())
-            .cloned()
-            .collect();
-
-        let candidates = if healthy.is_empty() {
-            remaining
-        } else {
-            healthy
+        let remaining = Candidates {
+            backends: &self.backends,
+            exclude,
+            healthy_only: false,
         };
-        if candidates.is_empty() {
-            return None;
-        }
+        let healthy = Candidates {
+            healthy_only: true,
+            ..remaining
+        };
 
-        let index = self.strategy.choose(&candidates, client);
-        Some(Lease::new(Arc::clone(&candidates[index])))
+        let any_healthy = healthy.iter().next().is_some();
+        let candidates = if any_healthy { healthy } else { remaining };
+
+        // A backend can turn unhealthy while the strategy is choosing; fall back
+        // to any remaining backend rather than failing the connection.
+        let backend = self
+            .strategy
+            .choose(candidates, client)
+            .or_else(|| remaining.iter().next())?;
+        Some(Lease::new(Arc::clone(backend)))
     }
 
     pub fn backends(&self) -> &[Arc<Backend>] {
@@ -266,7 +302,7 @@ mod tests {
 
     #[test]
     fn rebuild_keeps_state_of_backends_that_stay() {
-        let old = Pool::new(addrs(2), Algorithm::RoundRobin).unwrap();
+        let old = Pool::new(addrs(2), Algorithm::RoundRobin);
         let held = old.lease(CLIENT, &[old.backends()[0].addr()]).unwrap();
         old.backends()[0].set_healthy(false);
 
@@ -274,7 +310,7 @@ mod tests {
             old.backends()[1].addr(),
             SocketAddr::from(([127, 0, 0, 1], 9)),
         ];
-        let new = Pool::rebuild(Some(&old), new_addrs, Algorithm::LeastConn).unwrap();
+        let new = Pool::rebuild(Some(&old), new_addrs, Algorithm::LeastConn);
 
         assert!(Arc::ptr_eq(&new.backends()[0], &old.backends()[1]));
         assert_eq!(new.backends()[0].active_connections(), 1);
@@ -286,13 +322,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_pool() {
-        assert!(Pool::new([], Algorithm::RoundRobin).is_err());
+    fn empty_pool_has_nothing_to_lease() {
+        let pool = Pool::new([], Algorithm::RoundRobin);
+        assert!(pool.lease(CLIENT, &[]).is_none());
     }
 
     #[test]
     fn round_robin_cycles_through_backends() {
-        let pool = Pool::new(addrs(3), Algorithm::RoundRobin).unwrap();
+        let pool = Pool::new(addrs(3), Algorithm::RoundRobin);
 
         let ports: Vec<u16> = (0..6).map(|_| lease(&pool).addr().port()).collect();
 
@@ -301,7 +338,7 @@ mod tests {
 
     #[test]
     fn least_connections_prefers_idle_backend() {
-        let pool = Pool::new(addrs(3), Algorithm::LeastConn).unwrap();
+        let pool = Pool::new(addrs(3), Algorithm::LeastConn);
 
         let first = lease(&pool);
         let second = lease(&pool);
@@ -314,7 +351,7 @@ mod tests {
 
     #[test]
     fn dropping_lease_releases_connection() {
-        let pool = Pool::new(addrs(1), Algorithm::RoundRobin).unwrap();
+        let pool = Pool::new(addrs(1), Algorithm::RoundRobin);
         let backend = &pool.backends()[0];
 
         let leased = lease(&pool);
@@ -326,7 +363,7 @@ mod tests {
 
     #[test]
     fn skips_unhealthy_backends() {
-        let pool = Pool::new(addrs(3), Algorithm::RoundRobin).unwrap();
+        let pool = Pool::new(addrs(3), Algorithm::RoundRobin);
         pool.backends()[1].set_healthy(false);
 
         let ports: Vec<u16> = (0..4).map(|_| lease(&pool).addr().port()).collect();
@@ -336,7 +373,7 @@ mod tests {
 
     #[test]
     fn fails_open_when_no_backend_is_healthy() {
-        let pool = Pool::new(addrs(2), Algorithm::RoundRobin).unwrap();
+        let pool = Pool::new(addrs(2), Algorithm::RoundRobin);
         for backend in pool.backends() {
             backend.set_healthy(false);
         }
@@ -346,7 +383,7 @@ mod tests {
 
     #[test]
     fn excludes_already_tried_backends() {
-        let pool = Pool::new(addrs(2), Algorithm::RoundRobin).unwrap();
+        let pool = Pool::new(addrs(2), Algorithm::RoundRobin);
         let first = pool.backends()[0].addr();
         let second = pool.backends()[1].addr();
 
@@ -356,7 +393,7 @@ mod tests {
 
     #[test]
     fn ip_hash_keeps_a_client_on_one_backend() {
-        let pool = Pool::new(addrs(4), Algorithm::IpHash).unwrap();
+        let pool = Pool::new(addrs(4), Algorithm::IpHash);
         let host = client(7);
 
         let first = pool.lease(host, &[]).unwrap().addr();
@@ -368,7 +405,7 @@ mod tests {
 
     #[test]
     fn ip_hash_spreads_clients_across_backends() {
-        let pool = Pool::new(addrs(4), Algorithm::IpHash).unwrap();
+        let pool = Pool::new(addrs(4), Algorithm::IpHash);
 
         let ports = assignments(&pool, 4000);
 
@@ -383,7 +420,7 @@ mod tests {
 
     #[test]
     fn ip_hash_only_moves_clients_of_a_removed_backend() {
-        let pool = Pool::new(addrs(4), Algorithm::IpHash).unwrap();
+        let pool = Pool::new(addrs(4), Algorithm::IpHash);
         let before = assignments(&pool, 4000);
 
         pool.backends()[2].set_healthy(false);

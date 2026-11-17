@@ -30,7 +30,7 @@ async fn spawn_named_backend(name: &'static str) -> SocketAddr {
 async fn spawn_strait(backends: Vec<SocketAddr>, algorithm: Algorithm) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let pool = Pool::new(backends, algorithm).unwrap();
+    let pool = Pool::new(backends, algorithm);
     tokio::spawn(strait::run(
         listener,
         Arc::new(pool),
