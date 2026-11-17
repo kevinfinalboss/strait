@@ -6,11 +6,13 @@
 
 mod balancer;
 mod config;
+mod discovery;
 mod health;
 mod metrics;
 mod relay;
 mod server;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,14 +21,20 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
+use tokio_util::task::TaskTracker;
 use tracing::{Instrument, info, info_span, warn};
 
 pub use balancer::{
-    Algorithm, Backend, IpHash, Lease, LeastConnections, Pool, RoundRobin, Strategy,
+    Algorithm, Backend, Candidates, IpHash, Lease, LeastConnections, Pool, RoundRobin, Strategy,
 };
-pub use config::{Config, HealthCheckConfig, ListenerConfig, MetricsConfig};
+pub use config::{
+    Config, HealthCheckConfig, KubernetesBackends, ListenerConfig, MetricsConfig, ServicePort,
+};
 pub use health::{HealthCheck, HealthChecks, spawn as spawn_health_checks};
-pub use metrics::{BackendState, Metrics, ReloadResult, TransferCounters, serve_metrics};
+pub use metrics::{
+    BackendMetrics, BackendState, ListenerMetrics, Metrics, ReloadResult, TransferCounters,
+    serve_metrics,
+};
 pub use relay::{Transferred, relay};
 pub use server::{ReloadSummary, Server};
 
@@ -58,18 +66,58 @@ pub struct Route {
     pub pool: Arc<Pool>,
     pub proxy: ProxyConfig,
     pub metrics: Arc<Metrics>,
+    listener_metrics: ListenerMetrics,
+    /// Metric handles of every backend in `pool`, so connections never build labels.
+    backend_metrics: HashMap<SocketAddr, Arc<BackendMetrics>>,
+    /// Every connection task of the listener, so shutdown can wait for them.
+    connections: TaskTracker,
+}
+
+impl Route {
+    pub fn new(
+        name: impl Into<Arc<str>>,
+        pool: Arc<Pool>,
+        proxy: ProxyConfig,
+        metrics: Arc<Metrics>,
+        connections: TaskTracker,
+    ) -> Self {
+        let name = name.into();
+        let backend_metrics = pool
+            .backends()
+            .iter()
+            .map(|backend| (backend.addr(), metrics.backend(&name, backend.addr())))
+            .collect();
+        Self {
+            listener_metrics: metrics.listener(&name),
+            backend_metrics,
+            name,
+            pool,
+            proxy,
+            metrics,
+            connections,
+        }
+    }
+
+    fn backend_metrics(&self, backend: SocketAddr) -> Arc<BackendMetrics> {
+        match self.backend_metrics.get(&backend) {
+            Some(handles) => Arc::clone(handles),
+            // Unreachable while leases come from `pool`; kept as a safe fallback.
+            None => self.metrics.backend(&self.name, backend),
+        }
+    }
 }
 
 /// Accepts connections on `listener` forever and forwards each one to a backend from `pool`.
 ///
 /// Takes an already bound listener so callers (and tests) can bind to port 0.
 pub async fn run(listener: TcpListener, pool: Arc<Pool>, config: ProxyConfig) -> Result<()> {
-    let route = Arc::new(ArcSwap::from_pointee(Route {
-        name: "default".into(),
+    let route = Arc::new(ArcSwap::from_pointee(Route::new(
+        "default",
         pool,
-        proxy: config,
-        metrics: Arc::new(Metrics::default()),
-    }));
+        config,
+        Arc::new(Metrics::default()),
+        TaskTracker::new(),
+    )));
     serve(listener, route).await
 }
 
@@ -88,17 +136,12 @@ pub async fn serve(listener: TcpListener, route: Arc<ArcSwap<Route>>) -> Result<
         // Each connection keeps the route that was current when it arrived, so a
         // reload never changes the backend pool under an open connection.
         let route = route.load_full();
-        route
-            .metrics
-            .accepted
-            .get_or_create(&metrics::ListenerLabels {
-                listener: route.name.to_string(),
-            })
-            .inc();
+        route.listener_metrics.accepted.inc();
 
         // One task per connection, so a slow or failing peer never blocks the accept loop.
         let span = info_span!("conn", listener = %route.name);
-        tokio::spawn(
+        let connections = route.connections.clone();
+        connections.spawn(
             async move {
                 if let Err(err) = handle(client, peer, &route).await {
                     warn!(%peer, error = %err, "connection failed");
@@ -112,29 +155,13 @@ pub async fn serve(listener: TcpListener, route: Arc<ArcSwap<Route>>) -> Result<
 /// Connects `client` to a backend, retrying on others if needed, then relays bytes
 /// until both sides close. The lease is released when this function returns.
 async fn handle(mut client: TcpStream, peer: SocketAddr, route: &Route) -> Result<()> {
-    let metrics = &route.metrics;
-    let error = |reason| {
-        metrics
-            .connection_errors
-            .get_or_create(&metrics::ConnectionErrorLabels {
-                listener: route.name.to_string(),
-                reason,
-            })
-            .inc();
-    };
-
-    let Ok((lease, mut upstream)) = connect(route, peer).await.inspect_err(|_| {
-        error(metrics::ConnectionError::NoBackend);
+    let Ok((lease, mut upstream, metrics)) = connect(route, peer).await.inspect_err(|_| {
+        route.listener_metrics.no_backend.inc();
     }) else {
         bail!("no backend accepted the connection");
     };
     let backend = lease.addr();
-    let labels = metrics::BackendLabels {
-        listener: route.name.to_string(),
-        backend: backend.to_string(),
-    };
-    metrics.backend_connections.get_or_create(&labels).inc();
-    let counters = TransferCounters::new(metrics, &labels.listener, &labels.backend);
+    metrics.connections.inc();
     let started = Instant::now();
 
     client.set_nodelay(true)?;
@@ -146,15 +173,16 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, route: &Route) -> Resul
         &mut client,
         &mut upstream,
         route.proxy.idle_timeout,
-        &counters,
+        &metrics.transfer,
     )
     .await;
     metrics
         .connection_duration
-        .get_or_create(&labels)
         .observe(started.elapsed().as_secs_f64());
     let transferred = result
-        .inspect_err(|_| error(metrics::ConnectionError::Relay))
+        .inspect_err(|_| {
+            route.listener_metrics.relay_errors.inc();
+        })
         .with_context(|| format!("relay to {backend} stopped"))?;
 
     info!(
@@ -168,7 +196,10 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, route: &Route) -> Resul
 }
 
 /// Tries up to `1 + retries` different backends and returns the first that accepts.
-async fn connect(route: &Route, client: SocketAddr) -> Result<(Lease, TcpStream)> {
+async fn connect(
+    route: &Route,
+    client: SocketAddr,
+) -> Result<(Lease, TcpStream, Arc<BackendMetrics>)> {
     let config = route.proxy;
     let mut tried: Vec<SocketAddr> = Vec::new();
 
@@ -177,19 +208,15 @@ async fn connect(route: &Route, client: SocketAddr) -> Result<(Lease, TcpStream)
             break;
         };
         let backend = lease.addr();
+        let metrics = route.backend_metrics(backend);
         let started = Instant::now();
 
         let failure = match timeout(config.connect_timeout, TcpStream::connect(backend)).await {
             Ok(Ok(upstream)) => {
-                route
-                    .metrics
+                metrics
                     .connect_duration
-                    .get_or_create(&metrics::BackendLabels {
-                        listener: route.name.to_string(),
-                        backend: backend.to_string(),
-                    })
                     .observe(started.elapsed().as_secs_f64());
-                return Ok((lease, upstream));
+                return Ok((lease, upstream, metrics));
             }
             Ok(Err(err)) => {
                 warn!(%backend, error = %err, "backend refused connection");
@@ -200,15 +227,7 @@ async fn connect(route: &Route, client: SocketAddr) -> Result<(Lease, TcpStream)
                 metrics::ConnectFailure::Timeout
             }
         };
-        route
-            .metrics
-            .connect_failures
-            .get_or_create(&metrics::ConnectFailureLabels {
-                listener: route.name.to_string(),
-                backend: backend.to_string(),
-                reason: failure,
-            })
-            .inc();
+        metrics.connect_failure(failure).inc();
         tried.push(backend);
     }
 

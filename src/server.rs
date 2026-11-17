@@ -2,16 +2,21 @@
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
+use kube::Client;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tracing::{Instrument, error, info_span};
+use tokio::time::timeout;
+use tokio_util::task::TaskTracker;
+use tracing::{Instrument, error, info, info_span};
 
 use crate::balancer::Pool;
 use crate::config::{Config, ListenerConfig};
+use crate::discovery;
 use crate::health::{self, HealthChecks};
 use crate::metrics::{BackendState, Metrics};
 use crate::{Route, serve};
@@ -24,13 +29,34 @@ pub struct Server {
     listeners: Vec<Running>,
     metrics: Arc<Metrics>,
     state: BackendState,
+    /// Created on the first config that discovers backends from Kubernetes.
+    kube: Option<Client>,
+    /// Connection tasks of every listener, including removed ones.
+    connections: TaskTracker,
 }
 
 struct Running {
     config: ListenerConfig,
     local_addr: SocketAddr,
-    route: Arc<ArcSwap<Route>>,
+    upstream: Arc<Upstream>,
     accept: JoinHandle<()>,
+    discovery: Option<JoinHandle<()>>,
+}
+
+/// The parts of a listener that a reload or a discovery update can change.
+///
+/// Both go through [`Upstream::apply`], under one lock, so a config reload and
+/// an endpoint change never overwrite each other.
+struct Upstream {
+    route: Arc<ArcSwap<Route>>,
+    metrics: Arc<Metrics>,
+    connections: TaskTracker,
+    state: Mutex<UpstreamState>,
+}
+
+struct UpstreamState {
+    config: ListenerConfig,
+    backends: Vec<SocketAddr>,
     health: HealthChecks,
 }
 
@@ -54,6 +80,8 @@ impl Server {
             listeners: Vec::new(),
             metrics,
             state: BackendState::default(),
+            kube: None,
+            connections: TaskTracker::new(),
         };
         server.reload(config).await?;
         Ok(server)
@@ -78,6 +106,13 @@ impl Server {
     /// with, including on listeners that the new config removes.
     pub async fn reload(&mut self, config: &Config) -> Result<ReloadSummary> {
         config.validate()?;
+
+        if self.kube.is_none() && config.listeners.iter().any(|l| l.kubernetes.is_some()) {
+            let client = Client::try_default()
+                .await
+                .context("could not connect to the Kubernetes API")?;
+            self.kube = Some(client);
+        }
 
         // Bind every new address before touching anything, so a port that is
         // already taken aborts the reload with the old listeners still running.
@@ -112,7 +147,7 @@ impl Server {
                     if running.config == *listener {
                         summary.unchanged.push(name);
                     } else {
-                        running.update(listener.clone(), &self.metrics)?;
+                        running.update(listener.clone(), self.kube.as_ref());
                         summary.updated.push(name);
                     }
                     self.listeners.push(running);
@@ -123,39 +158,66 @@ impl Server {
                         .position(|(addr, _)| *addr == listener.listen)
                         .expect("every new address was bound above");
                     let (_, socket) = bound.swap_remove(index);
-                    self.listeners
-                        .push(Running::start(listener.clone(), socket, &self.metrics)?);
+                    self.listeners.push(Running::start(
+                        listener.clone(),
+                        socket,
+                        &self.metrics,
+                        &self.connections,
+                        self.kube.as_ref(),
+                    )?);
                     summary.added.push(name);
                 }
             }
         }
 
-        // Dropping a listener stops its accept loop and health checks.
+        // Dropping a listener stops its accept loop, discovery and health checks.
         summary.removed = previous.iter().map(|r| r.config.name.clone()).collect();
         self.state.set(
             self.listeners
                 .iter()
-                .map(|r| Arc::clone(&r.route))
+                .map(|r| Arc::clone(&r.upstream.route))
                 .collect(),
         );
         Ok(summary)
     }
+
+    /// Stops accepting connections, then waits up to `grace` for the open ones
+    /// to finish. Returns how many were still open when `grace` ran out; they
+    /// are cut when the runtime shuts down.
+    pub async fn shutdown(self, grace: Duration) -> usize {
+        // Dropping the listeners closes their sockets and stops discovery.
+        drop(self.listeners);
+        self.connections.close();
+
+        let open = self.connections.len();
+        if open == 0 {
+            return 0;
+        }
+        info!(connections = open, grace = %humantime::format_duration(grace), "draining connections");
+        match timeout(grace, self.connections.wait()).await {
+            Ok(()) => 0,
+            Err(_) => self.connections.len(),
+        }
+    }
 }
 
 impl Running {
-    fn start(config: ListenerConfig, socket: TcpListener, metrics: &Arc<Metrics>) -> Result<Self> {
+    fn start(
+        config: ListenerConfig,
+        socket: TcpListener,
+        metrics: &Arc<Metrics>,
+        connections: &TaskTracker,
+        kube: Option<&Client>,
+    ) -> Result<Self> {
         let local_addr = socket.local_addr()?;
-        let pool = Arc::new(Pool::new(config.backends.iter().copied(), config.strategy)?);
-        let health = health::spawn(&pool, config.health());
-        let route = Arc::new(ArcSwap::from_pointee(Route {
-            name: config.name.as_str().into(),
-            pool,
-            proxy: config.proxy(),
-            metrics: Arc::clone(metrics),
-        }));
+        let upstream = Arc::new(Upstream::new(
+            config.clone(),
+            Arc::clone(metrics),
+            connections.clone(),
+        ));
 
         let accept = tokio::spawn({
-            let route = Arc::clone(&route);
+            let route = Arc::clone(&upstream.route);
             let span = info_span!("listener", name = %config.name);
             async move {
                 if let Err(err) = serve(socket, route).await {
@@ -164,41 +226,121 @@ impl Running {
             }
             .instrument(span)
         });
+        let discovery = start_discovery(&config, &upstream, kube);
 
         Ok(Self {
             config,
             local_addr,
-            route,
+            upstream,
             accept,
-            health,
+            discovery,
         })
     }
 
-    /// Swaps in a new pool and settings. Backends that stay keep their state.
-    fn update(&mut self, config: ListenerConfig, metrics: &Arc<Metrics>) -> Result<()> {
-        let current = self.route.load();
-        let pool = Arc::new(Pool::rebuild(
-            Some(&current.pool),
-            config.backends.iter().copied(),
-            config.strategy,
-        )?);
-
-        // Replacing the guard stops the health checks of the previous pool.
-        self.health = health::spawn(&pool, config.health());
-        self.route.store(Arc::new(Route {
-            name: config.name.as_str().into(),
-            pool,
-            proxy: config.proxy(),
-            metrics: Arc::clone(metrics),
-        }));
+    /// Applies new settings in place. Backends that stay keep their state.
+    fn update(&mut self, config: ListenerConfig, kube: Option<&Client>) {
+        // A different Kubernetes source needs a new watch. Until it reports, the
+        // listener keeps the backends it already had instead of dropping to none.
+        if config.kubernetes != self.config.kubernetes {
+            if let Some(task) = self.discovery.take() {
+                task.abort();
+            }
+            self.discovery = start_discovery(&config, &self.upstream, kube);
+        }
+        self.upstream.reconfigure(config.clone());
         self.config = config;
-        Ok(())
     }
+}
+
+fn start_discovery(
+    config: &ListenerConfig,
+    upstream: &Arc<Upstream>,
+    kube: Option<&Client>,
+) -> Option<JoinHandle<()>> {
+    let source = config.kubernetes.clone()?;
+    let client = kube.expect("a Kubernetes client exists whenever a listener needs one");
+    let upstream = Arc::clone(upstream);
+    let span = info_span!("listener", name = %config.name);
+    Some(discovery::spawn(
+        client.clone(),
+        source,
+        span,
+        move |backends| {
+            upstream.set_backends(backends);
+        },
+    ))
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
         self.accept.abort();
+        if let Some(task) = &self.discovery {
+            task.abort();
+        }
+    }
+}
+
+impl Upstream {
+    fn new(config: ListenerConfig, metrics: Arc<Metrics>, connections: TaskTracker) -> Self {
+        // Kubernetes listeners start empty and fill in on the first endpoint list.
+        let backends = config.backends.clone();
+        let pool = Arc::new(Pool::new(backends.iter().copied(), config.strategy));
+        let health = health::spawn(&pool, config.health());
+        let route = Arc::new(ArcSwap::from_pointee(Route::new(
+            config.name.as_str(),
+            pool,
+            config.proxy(),
+            Arc::clone(&metrics),
+            connections.clone(),
+        )));
+        Self {
+            route,
+            metrics,
+            connections,
+            state: Mutex::new(UpstreamState {
+                config,
+                backends,
+                health,
+            }),
+        }
+    }
+
+    /// New listener settings from a reload. Static listeners also take their
+    /// backends from the config; Kubernetes ones keep what discovery found.
+    fn reconfigure(&self, config: ListenerConfig) {
+        let mut state = self.state.lock().expect("upstream lock poisoned");
+        if config.kubernetes.is_none() {
+            state.backends = config.backends.clone();
+        }
+        state.config = config;
+        self.apply(&mut state);
+    }
+
+    /// New backend list from discovery.
+    fn set_backends(&self, backends: Vec<SocketAddr>) {
+        let mut state = self.state.lock().expect("upstream lock poisoned");
+        state.backends = backends;
+        self.apply(&mut state);
+    }
+
+    fn apply(&self, state: &mut UpstreamState) {
+        let config = &state.config;
+        let current = self.route.load();
+        let pool = Arc::new(Pool::rebuild(
+            Some(&current.pool),
+            state.backends.iter().copied(),
+            config.strategy,
+        ));
+
+        // Replacing the guard stops the health checks of the previous pool.
+        state.health = health::spawn(&pool, config.health());
+        self.route.store(Arc::new(Route::new(
+            config.name.as_str(),
+            pool,
+            config.proxy(),
+            Arc::clone(&self.metrics),
+            self.connections.clone(),
+        )));
     }
 }
 
