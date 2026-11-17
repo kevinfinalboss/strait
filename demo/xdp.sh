@@ -160,6 +160,20 @@ demo() {
     echo "== the load balancer never sees a reply: it only counts client packets"
     xdp_metric packets
     xdp_metric no_backend
+
+    echo
+    echo "== the client's link grows to 3000 bytes, as large as the load balancer's:"
+    echo "   its packets no longer fit once encapsulated, so strait answers them"
+    echo "   with ICMP and the client lowers its path MTU by the 20 bytes of IP-in-IP"
+    run st-client ip link set c0 mtu 3000
+    run st-router ip link set r-c mtu 3000
+    run st-client python3 -c '
+import socket
+s = socket.create_connection(("'"$VIP"'", 80), timeout=3)
+s.sendall(b"POST / HTTP/1.1\r\nHost: vip\r\nContent-Length: 100000\r\n\r\n" + b"x" * 100000)
+'
+    run st-client ip route get "$VIP" | grep -o "mtu [0-9]*"
+    xdp_metric too_big
 }
 
 case ${1:-} in
