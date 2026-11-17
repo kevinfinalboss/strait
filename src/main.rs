@@ -56,6 +56,10 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     retries: usize,
 
+    /// Send backends a PROXY protocol header with the client's address
+    #[arg(long, value_enum, value_name = "VERSION")]
+    proxy_protocol: Option<strait::ProxyProtocol>,
+
     /// Time between health checks of each backend
     #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
     health_interval: Duration,
@@ -106,6 +110,7 @@ impl Args {
                     timeout: self.health_timeout,
                     ..HealthCheckConfig::default()
                 },
+                proxy_protocol: self.proxy_protocol,
             }],
             metrics: None,
             xdp: None,

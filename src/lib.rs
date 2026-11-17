@@ -10,6 +10,7 @@ mod discovery;
 mod health;
 pub mod maglev;
 mod metrics;
+mod proxy_protocol;
 mod relay;
 mod server;
 #[cfg(feature = "xdp")]
@@ -22,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::task::TaskTracker;
@@ -39,6 +41,7 @@ pub use metrics::{
     BackendMetrics, BackendState, ListenerMetrics, Metrics, ReloadResult, TransferCounters,
     serve_metrics,
 };
+pub use proxy_protocol::{ProxyProtocol, header_v2 as proxy_protocol_v2};
 pub use relay::{Transferred, relay};
 pub use server::{ReloadSummary, Server};
 
@@ -51,6 +54,9 @@ pub struct ProxyConfig {
     pub idle_timeout: Duration,
     /// Extra backends to try when connecting to the chosen one fails.
     pub retries: usize,
+    /// Header sent to the backend before any client byte, carrying the
+    /// client's address.
+    pub proxy_protocol: Option<ProxyProtocol>,
 }
 
 impl Default for ProxyConfig {
@@ -59,6 +65,7 @@ impl Default for ProxyConfig {
             connect_timeout: Duration::from_secs(3),
             idle_timeout: Duration::from_secs(300),
             retries: 2,
+            proxy_protocol: None,
         }
     }
 }
@@ -170,6 +177,19 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, route: &Route) -> Resul
 
     client.set_nodelay(true)?;
     upstream.set_nodelay(true)?;
+
+    if let Some(ProxyProtocol::V2) = route.proxy.proxy_protocol {
+        // The address the client connected to, which a wildcard listener
+        // only knows per connection.
+        let header = proxy_protocol::header_v2(peer, client.local_addr()?);
+        upstream
+            .write_all(&header)
+            .await
+            .inspect_err(|_| {
+                route.listener_metrics.relay_errors.inc();
+            })
+            .with_context(|| format!("could not send the PROXY header to {backend}"))?;
+    }
 
     // Per-connection logs are debug: at info they would cost more than the
     // proxying itself under load. Metrics cover the totals; failures are warn.
