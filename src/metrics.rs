@@ -77,6 +77,48 @@ pub struct ConnectionErrorLabels {
     pub reason: ConnectionError,
 }
 
+/// Why a UDP flow ended.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum FlowEnd {
+    /// No packet in either direction for the idle timeout.
+    Idle,
+    /// Its backend left the listener. The flow is dropped rather than moved,
+    /// since the backend may hold state for it.
+    BackendGone,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct FlowEndLabels {
+    pub listener: String,
+    pub reason: FlowEnd,
+}
+
+/// Why a UDP packet from a client was dropped.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum UdpDrop {
+    /// No backend to start a flow with: none in the pool, or (with
+    /// `stun-username`) the named pod is not ready.
+    NoBackend,
+    /// `stun-username`: the first packet of a flow is not a STUN Binding
+    /// Request with a USERNAME.
+    NotStun,
+    /// `stun-username`: the ufrag does not match the template.
+    UnknownUfrag,
+    /// The listener has `max_flows` flows already.
+    TableFull,
+    /// The backend has `max_flows_per_backend` flows already.
+    BackendFull,
+    /// The packet could not be handed to the kernel, usually a full socket
+    /// buffer.
+    SendFailed,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct UdpDropLabels {
+    pub listener: String,
+    pub reason: UdpDrop,
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum ReloadResult {
     Success,
@@ -109,6 +151,15 @@ label_values!(ConnectionError {
     ConnectionError::NoBackend => "no_backend",
     ConnectionError::Relay => "relay",
 });
+label_values!(FlowEnd { FlowEnd::Idle => "idle", FlowEnd::BackendGone => "backend_gone" });
+label_values!(UdpDrop {
+    UdpDrop::NoBackend => "no_backend",
+    UdpDrop::NotStun => "not_stun",
+    UdpDrop::UnknownUfrag => "unknown_ufrag",
+    UdpDrop::TableFull => "table_full",
+    UdpDrop::BackendFull => "backend_full",
+    UdpDrop::SendFailed => "send_failed",
+});
 label_values!(ReloadResult { ReloadResult::Success => "success", ReloadResult::Failure => "failure" });
 
 type HistogramFamily<L> = Family<L, Histogram, fn() -> Histogram>;
@@ -123,6 +174,9 @@ pub struct Metrics {
     live: Arc<Mutex<HashMap<BackendLabels, Weak<BackendMetrics>>>>,
     /// Same as `live`, for listeners.
     live_listeners: Arc<Mutex<HashMap<String, Weak<ListenerMetrics>>>>,
+    /// Same as `live`, for the UDP series of listeners and backends.
+    live_udp: Arc<Mutex<HashMap<String, Weak<UdpListenerMetrics>>>>,
+    live_udp_backends: Arc<Mutex<HashMap<BackendLabels, Weak<UdpBackendMetrics>>>>,
     pub accepted: Family<ListenerLabels, Counter>,
     pub backend_connections: Family<BackendLabels, Counter>,
     pub connect_failures: Family<ConnectFailureLabels, Counter>,
@@ -131,6 +185,9 @@ pub struct Metrics {
     pub connect_duration: HistogramFamily<BackendLabels>,
     pub connection_duration: HistogramFamily<BackendLabels>,
     pub reloads: Family<ReloadLabels, Counter>,
+    pub udp_packets: Family<TransferLabels, Counter>,
+    pub udp_flows_ended: Family<FlowEndLabels, Counter>,
+    pub udp_dropped: Family<UdpDropLabels, Counter>,
 }
 
 fn connect_buckets() -> Histogram {
@@ -148,6 +205,8 @@ impl Default for Metrics {
         Self {
             live: Arc::default(),
             live_listeners: Arc::default(),
+            live_udp: Arc::default(),
+            live_udp_backends: Arc::default(),
             accepted: Family::default(),
             backend_connections: Family::default(),
             connect_failures: Family::default(),
@@ -156,6 +215,9 @@ impl Default for Metrics {
             connect_duration: Family::new_with_constructor(connect_buckets),
             connection_duration: Family::new_with_constructor(connection_buckets),
             reloads: Family::default(),
+            udp_packets: Family::default(),
+            udp_flows_ended: Family::default(),
+            udp_dropped: Family::default(),
         }
     }
 }
@@ -196,6 +258,21 @@ impl Metrics {
             "strait_connection_duration_seconds",
             "Lifetime of relayed connections",
             self.connection_duration.clone(),
+        );
+        registry.register(
+            "strait_udp_packets",
+            "UDP datagrams relayed; sent is client to backend, received is backend to client",
+            self.udp_packets.clone(),
+        );
+        registry.register(
+            "strait_udp_flows_ended",
+            "UDP flows that ended, by reason",
+            self.udp_flows_ended.clone(),
+        );
+        registry.register(
+            "strait_udp_dropped",
+            "UDP datagrams from clients that were dropped, by reason",
+            self.udp_dropped.clone(),
         );
         registry.register(
             "strait_config_reloads",
@@ -303,6 +380,103 @@ impl Metrics {
         handles
     }
 
+    /// Handles for the UDP series of `listener`. Like
+    /// [`listener`](Self::listener), shared while held and removed with the
+    /// last holder.
+    pub fn udp_listener(&self, listener: &str) -> Arc<UdpListenerMetrics> {
+        let mut live = self.live_udp.lock().expect("metrics lock poisoned");
+        if let Some(existing) = live.get(listener).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let ended = |reason| {
+            self.udp_flows_ended
+                .get_or_create(&FlowEndLabels {
+                    listener: listener.to_owned(),
+                    reason,
+                })
+                .clone()
+        };
+        let dropped = UDP_DROPS.map(|reason| {
+            self.udp_dropped
+                .get_or_create(&UdpDropLabels {
+                    listener: listener.to_owned(),
+                    reason,
+                })
+                .clone()
+        });
+        let handles = Arc::new(UdpListenerMetrics {
+            ended_idle: ended(FlowEnd::Idle),
+            ended_backend_gone: ended(FlowEnd::BackendGone),
+            dropped,
+            listener: listener.to_owned(),
+            metrics: self.clone(),
+        });
+        live.insert(listener.to_owned(), Arc::downgrade(&handles));
+        handles
+    }
+
+    fn forget_udp_listener(&self, listener: &str) {
+        let mut live = self.live_udp.lock().expect("metrics lock poisoned");
+        if live
+            .get(listener)
+            .is_some_and(|weak| weak.strong_count() > 0)
+        {
+            return;
+        }
+        live.remove(listener);
+        for reason in [FlowEnd::Idle, FlowEnd::BackendGone] {
+            self.udp_flows_ended.remove(&FlowEndLabels {
+                listener: listener.to_owned(),
+                reason,
+            });
+        }
+        for reason in UDP_DROPS {
+            self.udp_dropped.remove(&UdpDropLabels {
+                listener: listener.to_owned(),
+                reason,
+            });
+        }
+    }
+
+    /// Handles for the UDP series of `backend` on `listener`; see
+    /// [`backend`](Self::backend).
+    pub fn udp_backend(&self, listener: &str, backend: SocketAddr) -> Arc<UdpBackendMetrics> {
+        let labels = BackendLabels {
+            listener: listener.to_owned(),
+            backend: backend.to_string(),
+        };
+        let mut live = self.live_udp_backends.lock().expect("metrics lock poisoned");
+        if let Some(existing) = live.get(&labels).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let handles = Arc::new(UdpBackendMetrics {
+            packets: TransferCounters::in_family(
+                &self.udp_packets,
+                &labels.listener,
+                &labels.backend,
+            ),
+            labels: labels.clone(),
+            metrics: self.clone(),
+        });
+        live.insert(labels, Arc::downgrade(&handles));
+        handles
+    }
+
+    fn forget_udp_backend(&self, labels: &BackendLabels) {
+        let mut live = self.live_udp_backends.lock().expect("metrics lock poisoned");
+        if live.get(labels).is_some_and(|weak| weak.strong_count() > 0) {
+            return;
+        }
+        live.remove(labels);
+        for direction in [Direction::Sent, Direction::Received] {
+            self.udp_packets.remove(&TransferLabels {
+                listener: labels.listener.clone(),
+                backend: labels.backend.clone(),
+                direction,
+            });
+        }
+    }
+
     /// Removes the series of `labels`, unless new handles for them were created
     /// after the old ones started dropping.
     fn forget(&self, labels: &BackendLabels) {
@@ -380,6 +554,65 @@ impl Drop for BackendMetrics {
     }
 }
 
+const UDP_DROPS: [UdpDrop; 6] = [
+    UdpDrop::NoBackend,
+    UdpDrop::NotStun,
+    UdpDrop::UnknownUfrag,
+    UdpDrop::TableFull,
+    UdpDrop::BackendFull,
+    UdpDrop::SendFailed,
+];
+
+/// UDP series of one listener. Created by [`Metrics::udp_listener`]; the
+/// series are removed when the last handle is dropped.
+#[derive(Debug)]
+pub struct UdpListenerMetrics {
+    pub ended_idle: Counter,
+    pub ended_backend_gone: Counter,
+    /// One counter per [`UdpDrop`], in the order of `UDP_DROPS`.
+    dropped: [Counter; 6],
+    listener: String,
+    metrics: Metrics,
+}
+
+impl UdpListenerMetrics {
+    pub fn dropped(&self, reason: UdpDrop) -> &Counter {
+        let index = UDP_DROPS
+            .iter()
+            .position(|r| *r == reason)
+            .expect("every reason is listed");
+        &self.dropped[index]
+    }
+
+    pub fn ended(&self, reason: FlowEnd) -> &Counter {
+        match reason {
+            FlowEnd::Idle => &self.ended_idle,
+            FlowEnd::BackendGone => &self.ended_backend_gone,
+        }
+    }
+}
+
+impl Drop for UdpListenerMetrics {
+    fn drop(&mut self) {
+        self.metrics.forget_udp_listener(&self.listener);
+    }
+}
+
+/// UDP series of one backend of one listener. Created by
+/// [`Metrics::udp_backend`]; removed when the last handle is dropped.
+#[derive(Debug)]
+pub struct UdpBackendMetrics {
+    pub packets: TransferCounters,
+    labels: BackendLabels,
+    metrics: Metrics,
+}
+
+impl Drop for UdpBackendMetrics {
+    fn drop(&mut self) {
+        self.metrics.forget_udp_backend(&self.labels);
+    }
+}
+
 /// Byte counters for one connection, looked up once so the relay only does atomic adds.
 #[derive(Debug, Clone, Default)]
 pub struct TransferCounters {
@@ -389,9 +622,17 @@ pub struct TransferCounters {
 
 impl TransferCounters {
     pub fn new(metrics: &Metrics, listener: &str, backend: &str) -> Self {
+        Self::in_family(&metrics.bytes, listener, backend)
+    }
+
+    /// Counters of `family`, which has a series per direction.
+    pub fn in_family(
+        family: &Family<TransferLabels, Counter>,
+        listener: &str,
+        backend: &str,
+    ) -> Self {
         let counter = |direction| {
-            metrics
-                .bytes
+            family
                 .get_or_create(&TransferLabels {
                     listener: listener.to_owned(),
                     backend: backend.to_owned(),

@@ -11,6 +11,8 @@ use serde::Deserialize;
 
 use crate::ProxyConfig;
 use crate::ProxyProtocol;
+use crate::stun::StunUsername;
+use crate::udp::{DEFAULT_MAX_FLOWS, DEFAULT_UDP_IDLE_TIMEOUT, UdpSettings};
 use crate::balancer::Algorithm;
 use crate::health::HealthCheck;
 
@@ -162,8 +164,10 @@ pub struct ListenerConfig {
     pub strategy: Algorithm,
     #[serde(default = "default_connect_timeout", with = "humantime_serde")]
     pub connect_timeout: Duration,
-    #[serde(default = "default_idle_timeout", with = "humantime_serde")]
-    pub idle_timeout: Duration,
+    /// Close a connection, or end a UDP flow, after this long without traffic.
+    /// Defaults to 5m for TCP and 30s for UDP; see [`Self::idle_timeout`].
+    #[serde(default, with = "humantime_serde")]
+    pub idle_timeout: Option<Duration>,
     #[serde(default = "default_retries")]
     pub retries: usize,
     #[serde(default)]
@@ -172,6 +176,15 @@ pub struct ListenerConfig {
     /// address. Proxy listeners only.
     #[serde(default)]
     pub proxy_protocol: Option<ProxyProtocol>,
+    /// UDP proxy: most flows open at once; a new client beyond it is dropped.
+    #[serde(default)]
+    pub max_flows: Option<usize>,
+    /// UDP proxy: most flows to one backend; unlimited by default.
+    #[serde(default)]
+    pub max_flows_per_backend: Option<usize>,
+    /// With `strategy: stun-username`, how a flow's first packet names its pod.
+    #[serde(default)]
+    pub stun_username: Option<StunUsername>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -229,10 +242,6 @@ fn default_strategy() -> Algorithm {
 
 fn default_connect_timeout() -> Duration {
     ProxyConfig::default().connect_timeout
-}
-
-fn default_idle_timeout() -> Duration {
-    ProxyConfig::default().idle_timeout
 }
 
 fn default_retries() -> usize {
@@ -323,7 +332,7 @@ impl ListenerConfig {
 
         let durations = [
             ("connect_timeout", self.connect_timeout),
-            ("idle_timeout", self.idle_timeout),
+            ("idle_timeout", self.idle_timeout()),
             ("health_check.interval", self.health_check.interval),
             ("health_check.timeout", self.health_check.timeout),
         ];
@@ -337,8 +346,35 @@ impl ListenerConfig {
             bail!("health_check thresholds must be at least 1");
         }
 
-        if self.protocol == Protocol::Udp && self.dataplane != Dataplane::Xdp {
-            bail!("protocol udp needs dataplane: xdp; the proxy relays TCP only");
+        let udp_proxy = self.protocol == Protocol::Udp && self.dataplane == Dataplane::Proxy;
+        if !udp_proxy {
+            for (field, set) in [
+                ("max_flows", self.max_flows.is_some()),
+                ("max_flows_per_backend", self.max_flows_per_backend.is_some()),
+            ] {
+                if set {
+                    bail!("{field} is for protocol udp listeners with dataplane proxy");
+                }
+            }
+        }
+        if self.max_flows == Some(0) || self.max_flows_per_backend == Some(0) {
+            bail!("max_flows and max_flows_per_backend must be at least 1");
+        }
+        if self.protocol == Protocol::Udp && self.proxy_protocol.is_some() {
+            bail!("proxy_protocol is for TCP listeners");
+        }
+        match (self.strategy == Algorithm::StunUsername, &self.stun_username) {
+            (true, None) => bail!("strategy stun-username needs the stun_username section"),
+            (false, Some(_)) => bail!("stun_username is only used by strategy stun-username"),
+            (true, Some(_)) if !udp_proxy => {
+                bail!("strategy stun-username is for protocol udp listeners with dataplane proxy")
+            }
+            (true, Some(_)) if self.kubernetes.is_none() => {
+                bail!(
+                    "strategy stun-username finds pods by name, so its backends must come from kubernetes"
+                )
+            }
+            _ => {}
         }
         if self.protocol == Protocol::Udp
             && self.health_check.enabled
@@ -383,10 +419,26 @@ impl ListenerConfig {
         Ok(())
     }
 
+    /// `idle_timeout`, or the default for the listener's protocol.
+    pub fn idle_timeout(&self) -> Duration {
+        self.idle_timeout.unwrap_or(match self.protocol {
+            Protocol::Tcp => ProxyConfig::default().idle_timeout,
+            Protocol::Udp => DEFAULT_UDP_IDLE_TIMEOUT,
+        })
+    }
+
+    pub fn udp(&self) -> UdpSettings {
+        UdpSettings {
+            max_flows: self.max_flows.unwrap_or(DEFAULT_MAX_FLOWS),
+            max_flows_per_backend: self.max_flows_per_backend,
+            stun_username: self.stun_username.clone().map(std::sync::Arc::new),
+        }
+    }
+
     pub fn proxy(&self) -> ProxyConfig {
         ProxyConfig {
             connect_timeout: self.connect_timeout,
-            idle_timeout: self.idle_timeout,
+            idle_timeout: self.idle_timeout(),
             retries: self.retries,
             proxy_protocol: self.proxy_protocol,
         }
@@ -443,7 +495,7 @@ listeners:
         assert_eq!(api.strategy, Algorithm::LeastConn);
         assert_eq!(api.backends.len(), 2);
         assert_eq!(api.connect_timeout, Duration::from_millis(500));
-        assert_eq!(api.idle_timeout, Duration::from_secs(60));
+        assert_eq!(api.idle_timeout(), Duration::from_secs(60));
         assert_eq!(api.retries, 1);
         assert_eq!(api.health_check.interval, Duration::from_secs(2));
         assert_eq!(api.health_check.unhealthy_threshold, 3);
@@ -611,9 +663,57 @@ listeners:
     }
 
     #[test]
+    fn checks_stun_username_listeners() {
+        let base = "listeners:\n  - name: rtc\n    listen: 0.0.0.0:3478\n    protocol: udp\n    kubernetes: { service: nes-session, port: 5000 }\n    health_check: { enabled: false }\n";
+        let stun = format!(
+            "{base}    strategy: stun-username\n    stun_username:\n      ufrag: \"nsp{{id}}\"\n      pod: \"nes-session-{{id}}\"\n"
+        );
+        let config = Config::parse(&stun).unwrap();
+        let routing = config.listeners[0].udp().stun_username.unwrap();
+        assert_eq!(routing.ufrag.to_string(), "nsp{id}");
+        assert_eq!(routing.pod.to_string(), "nes-session-{id}");
+
+        assert!(error(&stun.replace("nsp{id}", "nsp-{id}")).contains("not allowed in an ICE ufrag"));
+        assert!(
+            error(&format!("{base}    strategy: stun-username\n")).contains("needs the stun_username")
+        );
+        let without_strategy = stun.replace("    strategy: stun-username\n", "");
+        assert!(error(&without_strategy).contains("only used by strategy stun-username"));
+        let tcp = stun.replace("    protocol: udp\n", "");
+        assert!(error(&tcp).contains("for protocol udp listeners"));
+        let fixed = stun.replace(
+            "kubernetes: { service: nes-session, port: 5000 }",
+            "backends: [127.0.0.1:5000]",
+        );
+        assert!(error(&fixed).contains("must come from kubernetes"));
+    }
+
+    #[test]
     fn checks_udp_listeners() {
         let proxy_udp = "listeners:\n  - name: dns\n    listen: 127.0.0.1:53\n    protocol: udp\n    backends: [127.0.0.1:5353]\n";
-        assert!(error(proxy_udp).contains("needs dataplane: xdp"));
+        // The UDP proxy has TCP health checks too, so it needs a TCP port.
+        assert!(error(proxy_udp).contains("health_check.port"));
+        let unchecked = format!("{proxy_udp}    health_check:\n      enabled: false\n");
+        let config = Config::parse(&unchecked).unwrap();
+        let listener = &config.listeners[0];
+        assert_eq!(listener.idle_timeout(), crate::DEFAULT_UDP_IDLE_TIMEOUT);
+        assert_eq!(listener.udp().max_flows, crate::udp::DEFAULT_MAX_FLOWS);
+
+        let limited = format!("{unchecked}    max_flows: 10\n    max_flows_per_backend: 2\n");
+        let udp = Config::parse(&limited).unwrap().listeners[0].udp();
+        assert_eq!((udp.max_flows, udp.max_flows_per_backend), (10, Some(2)));
+        assert!(error(&limited.replace("max_flows: 10", "max_flows: 0")).contains("at least 1"));
+        let tcp_limited = "listeners:\n  - name: a\n    listen: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n    max_flows: 5\n";
+        assert!(error(tcp_limited).contains("max_flows is for protocol udp"));
+        assert!(
+            error(&format!("{unchecked}    proxy_protocol: v2\n")).contains("for TCP listeners")
+        );
+
+        // TCP and UDP listeners can share an address.
+        let both = format!(
+            "{unchecked}  - name: dns-tcp\n    listen: 127.0.0.1:53\n    backends: [127.0.0.1:5353]\n"
+        );
+        assert_eq!(Config::parse(&both).unwrap().listeners.len(), 2);
         if !cfg!(feature = "xdp") {
             return;
         }

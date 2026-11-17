@@ -16,14 +16,24 @@ use crate::config::{KubernetesBackends, ServicePort};
 /// Label that Kubernetes puts on every EndpointSlice of a Service.
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 
+/// Ready endpoints of a Service.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Endpoints {
+    /// Every ready address on the wanted port, sorted and without duplicates.
+    pub backends: Vec<SocketAddr>,
+    /// Ready addresses by the name of the pod behind them (`targetRef`). A
+    /// dual-stack pod maps to its lowest address, IPv4 before IPv6.
+    pub pods: BTreeMap<String, SocketAddr>,
+}
+
 /// Watches the EndpointSlices of `source` and calls `update` with the full list
-/// of ready backends every time it changes. Aborting the task stops the watch.
+/// of ready endpoints every time it changes. Aborting the task stops the watch.
 /// Logs are recorded inside `span`.
 pub fn spawn(
     client: Client,
     source: KubernetesBackends,
     span: Span,
-    update: impl Fn(Vec<SocketAddr>) + Send + 'static,
+    update: impl Fn(Endpoints) + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let namespace = source
@@ -47,14 +57,14 @@ pub fn spawn(
                     continue;
                 }
             };
-            if let Some(backends) = state.apply(event, &source.port) {
+            if let Some(endpoints) = state.apply(event, &source.port) {
                 info!(
                     service = %source.service,
                     %namespace,
-                    backends = backends.len(),
+                    backends = endpoints.backends.len(),
                     "kubernetes endpoints updated"
                 );
-                update(backends);
+                update(endpoints);
             }
         }
     }.instrument(span))
@@ -72,11 +82,11 @@ pub struct EndpointState {
     initial: BTreeMap<String, EndpointSlice>,
     syncing: bool,
     /// Last list handed out, so an unchanged list is not published again.
-    current: Option<Vec<SocketAddr>>,
+    current: Option<Endpoints>,
 }
 
 impl EndpointState {
-    /// Applies one watch event. Returns the new backend list when it changed.
+    /// Applies one watch event. Returns the new endpoints when they changed.
     ///
     /// During a (re)list nothing is published until the list is complete, so a
     /// relist never shrinks the backends to the slices seen so far. A completed
@@ -86,7 +96,7 @@ impl EndpointState {
         &mut self,
         event: Event<EndpointSlice>,
         port: &ServicePort,
-    ) -> Option<Vec<SocketAddr>> {
+    ) -> Option<Endpoints> {
         match event {
             Event::Init => {
                 self.syncing = true;
@@ -110,24 +120,34 @@ impl EndpointState {
             return None;
         }
 
-        let backends = ready_backends(self.slices.values(), port);
-        if self.current.as_ref() == Some(&backends) {
+        let endpoints = ready_endpoints(self.slices.values(), port);
+        if self.current.as_ref() == Some(&endpoints) {
             return None;
         }
-        self.current = Some(backends.clone());
-        Some(backends)
+        self.current = Some(endpoints.clone());
+        Some(endpoints)
     }
 }
 
 /// Ready endpoint addresses of `slices` on `port`, sorted and without duplicates.
-///
-/// Follows the EndpointSlice rules: an endpoint whose `ready` condition is unset
-/// counts as ready, and slices that do not expose the requested port are skipped.
-pub fn ready_backends<'a>(
+#[cfg(test)]
+fn ready_backends<'a>(
     slices: impl IntoIterator<Item = &'a EndpointSlice>,
     port: &ServicePort,
 ) -> Vec<SocketAddr> {
+    ready_endpoints(slices, port).backends
+}
+
+/// Ready endpoints of `slices` on `port`.
+///
+/// Follows the EndpointSlice rules: an endpoint whose `ready` condition is unset
+/// counts as ready, and slices that do not expose the requested port are skipped.
+pub fn ready_endpoints<'a>(
+    slices: impl IntoIterator<Item = &'a EndpointSlice>,
+    port: &ServicePort,
+) -> Endpoints {
     let mut backends = BTreeSet::new();
+    let mut pods: BTreeMap<String, SocketAddr> = BTreeMap::new();
 
     for slice in slices {
         if slice.address_type == "FQDN" {
@@ -146,15 +166,29 @@ pub fn ready_backends<'a>(
             if !ready {
                 continue;
             }
+            let pod = endpoint
+                .target_ref
+                .as_ref()
+                .filter(|target| target.kind.as_deref() == Some("Pod"))
+                .and_then(|target| target.name.as_deref());
             for address in &endpoint.addresses {
                 if let Ok(ip) = address.parse::<IpAddr>() {
-                    backends.insert(SocketAddr::new(ip, port));
+                    let addr = SocketAddr::new(ip, port);
+                    backends.insert(addr);
+                    if let Some(pod) = pod {
+                        pods.entry(pod.to_owned())
+                            .and_modify(|lowest| *lowest = (*lowest).min(addr))
+                            .or_insert(addr);
+                    }
                 }
             }
         }
     }
 
-    backends.into_iter().collect()
+    Endpoints {
+        backends: backends.into_iter().collect(),
+        pods,
+    }
 }
 
 /// Port number in `slice` for `wanted`: matched by name, or used as is when numeric.
@@ -279,6 +313,17 @@ mod tests {
         assert_eq!(backends, addrs(&["10.0.0.1:80", "[fd00::1]:80"]));
     }
 
+    impl EndpointState {
+        /// `apply`, keeping only the backend list.
+        fn apply_backends(
+            &mut self,
+            event: Event<EndpointSlice>,
+            port: &ServicePort,
+        ) -> Option<Vec<SocketAddr>> {
+            self.apply(event, port).map(|endpoints| endpoints.backends)
+        }
+    }
+
     fn named(name: &str, addresses: &[&str]) -> EndpointSlice {
         let mut slice = slice(
             "IPv4",
@@ -297,17 +342,17 @@ mod tests {
     fn publishes_the_initial_list_only_once_it_is_complete() {
         let mut state = EndpointState::default();
 
-        assert_eq!(state.apply(Event::Init, &http()), None);
+        assert_eq!(state.apply_backends(Event::Init, &http()), None);
         assert_eq!(
-            state.apply(Event::InitApply(named("a", &["10.0.0.1"])), &http()),
+            state.apply_backends(Event::InitApply(named("a", &["10.0.0.1"])), &http()),
             None
         );
         assert_eq!(
-            state.apply(Event::InitApply(named("b", &["10.0.0.2"])), &http()),
+            state.apply_backends(Event::InitApply(named("b", &["10.0.0.2"])), &http()),
             None
         );
         assert_eq!(
-            state.apply(Event::InitDone, &http()),
+            state.apply_backends(Event::InitDone, &http()),
             Some(addrs(&["10.0.0.1:80", "10.0.0.2:80"]))
         );
     }
@@ -315,37 +360,37 @@ mod tests {
     #[test]
     fn an_empty_service_publishes_an_empty_list() {
         let mut state = EndpointState::default();
-        state.apply(Event::Init, &http());
-        assert_eq!(state.apply(Event::InitDone, &http()), Some(vec![]));
+        state.apply_backends(Event::Init, &http());
+        assert_eq!(state.apply_backends(Event::InitDone, &http()), Some(vec![]));
     }
 
     #[test]
     fn follows_changes_and_skips_ones_that_change_nothing() {
         let mut state = EndpointState::default();
-        state.apply(Event::Init, &http());
-        state.apply(Event::InitApply(named("a", &["10.0.0.1"])), &http());
-        state.apply(Event::InitDone, &http());
+        state.apply_backends(Event::Init, &http());
+        state.apply_backends(Event::InitApply(named("a", &["10.0.0.1"])), &http());
+        state.apply_backends(Event::InitDone, &http());
 
         // A new slice adds its endpoints.
         assert_eq!(
-            state.apply(Event::Apply(named("b", &["10.0.0.2"])), &http()),
+            state.apply_backends(Event::Apply(named("b", &["10.0.0.2"])), &http()),
             Some(addrs(&["10.0.0.1:80", "10.0.0.2:80"]))
         );
         // Same endpoints again (a label change, say): nothing to publish.
         assert_eq!(
-            state.apply(Event::Apply(named("b", &["10.0.0.2"])), &http()),
+            state.apply_backends(Event::Apply(named("b", &["10.0.0.2"])), &http()),
             None
         );
         // A pod becoming unready leaves the list.
         let mut unready = named("b", &[]);
         unready.endpoints = Some(vec![endpoint("10.0.0.2", Some(false))]);
         assert_eq!(
-            state.apply(Event::Apply(unready), &http()),
+            state.apply_backends(Event::Apply(unready), &http()),
             Some(addrs(&["10.0.0.1:80"]))
         );
         // Deleting a slice removes its endpoints.
         assert_eq!(
-            state.apply(Event::Delete(named("a", &["10.0.0.1"])), &http()),
+            state.apply_backends(Event::Delete(named("a", &["10.0.0.1"])), &http()),
             Some(vec![])
         );
     }
@@ -353,19 +398,19 @@ mod tests {
     #[test]
     fn a_relist_keeps_the_old_list_until_done_then_drops_stale_slices() {
         let mut state = EndpointState::default();
-        state.apply(Event::Init, &http());
-        state.apply(Event::InitApply(named("a", &["10.0.0.1"])), &http());
-        state.apply(Event::InitApply(named("b", &["10.0.0.2"])), &http());
-        state.apply(Event::InitDone, &http());
+        state.apply_backends(Event::Init, &http());
+        state.apply_backends(Event::InitApply(named("a", &["10.0.0.1"])), &http());
+        state.apply_backends(Event::InitApply(named("b", &["10.0.0.2"])), &http());
+        state.apply_backends(Event::InitDone, &http());
 
         // The watch reconnects; slice "a" was deleted while it was down.
-        assert_eq!(state.apply(Event::Init, &http()), None);
+        assert_eq!(state.apply_backends(Event::Init, &http()), None);
         assert_eq!(
-            state.apply(Event::InitApply(named("b", &["10.0.0.2"])), &http()),
+            state.apply_backends(Event::InitApply(named("b", &["10.0.0.2"])), &http()),
             None
         );
         assert_eq!(
-            state.apply(Event::InitDone, &http()),
+            state.apply_backends(Event::InitDone, &http()),
             Some(addrs(&["10.0.0.2:80"]))
         );
     }
@@ -374,13 +419,57 @@ mod tests {
     fn a_relist_with_no_change_publishes_nothing() {
         let mut state = EndpointState::default();
         for _ in 0..2 {
-            state.apply(Event::Init, &http());
-            state.apply(Event::InitApply(named("a", &["10.0.0.1"])), &http());
-            state.apply(Event::InitDone, &http());
+            state.apply_backends(Event::Init, &http());
+            state.apply_backends(Event::InitApply(named("a", &["10.0.0.1"])), &http());
+            state.apply_backends(Event::InitDone, &http());
         }
-        state.apply(Event::Init, &http());
-        state.apply(Event::InitApply(named("a", &["10.0.0.1"])), &http());
-        assert_eq!(state.apply(Event::InitDone, &http()), None);
+        state.apply_backends(Event::Init, &http());
+        state.apply_backends(Event::InitApply(named("a", &["10.0.0.1"])), &http());
+        assert_eq!(state.apply_backends(Event::InitDone, &http()), None);
+    }
+
+    fn pod_endpoint(address: &str, pod: &str, ready: bool) -> Endpoint {
+        Endpoint {
+            target_ref: Some(k8s_openapi::api::core::v1::ObjectReference {
+                kind: Some("Pod".into()),
+                name: Some(pod.into()),
+                ..Default::default()
+            }),
+            ..endpoint(address, Some(ready))
+        }
+    }
+
+    #[test]
+    fn maps_ready_pods_to_their_address() {
+        let slices = [
+            slice(
+                "IPv4",
+                &[("rtc", 5000)],
+                vec![
+                    pod_endpoint("10.0.0.1", "nes-session-a1b2c", true),
+                    pod_endpoint("10.0.0.2", "nes-session-starting", false),
+                    endpoint("10.0.0.3", Some(true)),
+                ],
+            ),
+            slice(
+                "IPv6",
+                &[("rtc", 5000)],
+                vec![pod_endpoint("fd00::1", "nes-session-a1b2c", true)],
+            ),
+        ];
+
+        let endpoints = ready_endpoints(&slices, &ServicePort::Name("rtc".into()));
+
+        assert_eq!(
+            endpoints.backends,
+            addrs(&["10.0.0.1:5000", "10.0.0.3:5000", "[fd00::1]:5000"])
+        );
+        // Not-ready pods and endpoints without a pod are left out; a
+        // dual-stack pod keeps its IPv4 address.
+        assert_eq!(
+            endpoints.pods.into_iter().collect::<Vec<_>>(),
+            vec![("nes-session-a1b2c".to_owned(), "10.0.0.1:5000".parse().unwrap())]
+        );
     }
 
     #[test]
