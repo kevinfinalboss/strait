@@ -34,7 +34,12 @@ pub struct ListenerConfig {
     /// Identifies the listener in logs and across reloads.
     pub name: String,
     pub listen: SocketAddr,
+    /// Fixed backend addresses. Exactly one of `backends` and `kubernetes` is set.
+    #[serde(default)]
     pub backends: Vec<SocketAddr>,
+    /// Discover backends from the EndpointSlices of a Kubernetes Service.
+    #[serde(default)]
+    pub kubernetes: Option<KubernetesBackends>,
     #[serde(default = "default_strategy")]
     pub strategy: Algorithm,
     #[serde(default = "default_connect_timeout", with = "humantime_serde")]
@@ -45,6 +50,25 @@ pub struct ListenerConfig {
     pub retries: usize,
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubernetesBackends {
+    /// Name of the Service whose ready pods become backends.
+    pub service: String,
+    /// Namespace of the Service; defaults to the namespace strait runs in.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Port name from the Service, or the container port number.
+    pub port: ServicePort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum ServicePort {
+    Number(u16),
+    Name(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -134,8 +158,13 @@ impl Config {
 
 impl ListenerConfig {
     fn validate(&self) -> Result<()> {
-        if self.backends.is_empty() {
-            bail!("at least one backend is required");
+        match (&self.kubernetes, self.backends.is_empty()) {
+            (Some(_), false) => bail!("set either backends or kubernetes, not both"),
+            (None, true) => bail!("at least one backend is required, or a kubernetes service"),
+            (Some(kubernetes), true) if kubernetes.service.is_empty() => {
+                bail!("kubernetes.service cannot be empty")
+            }
+            _ => {}
         }
         let mut seen = HashSet::new();
         for backend in &self.backends {
@@ -280,6 +309,30 @@ listeners:
     fn rejects_metrics_on_a_listener_address() {
         let text = "metrics: {listen: 127.0.0.1:1}\nlisteners:\n  - {name: a, listen: 127.0.0.1:1, backends: [127.0.0.1:2]}\n";
         assert!(error(text).contains("metrics endpoint"));
+    }
+
+    #[test]
+    fn parses_kubernetes_backends() {
+        let text = "listeners:\n  - name: a\n    listen: 127.0.0.1:1\n    kubernetes:\n      service: web\n      namespace: shop\n      port: http\n  - name: b\n    listen: 127.0.0.1:2\n    kubernetes: {service: db, port: 5432}\n";
+        let config = Config::parse(text).unwrap();
+
+        let web = config.listeners[0].kubernetes.as_ref().unwrap();
+        assert_eq!(web.service, "web");
+        assert_eq!(web.namespace.as_deref(), Some("shop"));
+        assert_eq!(web.port, ServicePort::Name("http".into()));
+
+        let db = config.listeners[1].kubernetes.as_ref().unwrap();
+        assert_eq!(db.namespace, None);
+        assert_eq!(db.port, ServicePort::Number(5432));
+    }
+
+    #[test]
+    fn requires_exactly_one_backend_source() {
+        let both = "listeners:\n  - name: a\n    listen: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n    kubernetes: {service: web, port: 80}\n";
+        assert!(error(both).contains("either backends or kubernetes"));
+
+        let neither = "listeners:\n  - name: a\n    listen: 127.0.0.1:1\n";
+        assert!(error(neither).contains("or a kubernetes service"));
     }
 
     #[test]
