@@ -103,7 +103,7 @@ impl Args {
                 kubernetes: None,
                 strategy: self.strategy,
                 connect_timeout: self.connect_timeout,
-                idle_timeout: self.idle_timeout,
+                idle_timeout: Some(self.idle_timeout),
                 retries: self.retries,
                 health_check: HealthCheckConfig {
                     interval: self.health_interval,
@@ -111,6 +111,9 @@ impl Args {
                     ..HealthCheckConfig::default()
                 },
                 proxy_protocol: self.proxy_protocol,
+                max_flows: None,
+                max_flows_per_backend: None,
+                stun_username: None,
             }],
             metrics: None,
             xdp: None,

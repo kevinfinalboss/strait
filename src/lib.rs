@@ -1,8 +1,8 @@
 //! strait: a Layer 4 load balancer.
 //!
-//! TCP load balancing across multiple backends with active health checks,
-//! connection retries, timeouts, client IP affinity and a YAML config that can
-//! be reloaded without dropping connections.
+//! TCP and UDP load balancing across multiple backends with active health
+//! checks, connection retries, timeouts, client IP affinity and a YAML config
+//! that can be reloaded without dropping connections.
 
 mod balancer;
 mod config;
@@ -13,10 +13,12 @@ mod metrics;
 mod proxy_protocol;
 mod relay;
 mod server;
+mod stun;
+mod udp;
 #[cfg(feature = "xdp")]
 pub mod xdp;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,6 +46,8 @@ pub use metrics::{
 pub use proxy_protocol::{ProxyProtocol, header_v2 as proxy_protocol_v2};
 pub use relay::{Transferred, relay};
 pub use server::{ReloadSummary, Server};
+pub use stun::{StunUsername, Template as StunTemplate};
+pub use udp::{DEFAULT_UDP_IDLE_TIMEOUT, UdpSettings, serve as serve_udp};
 
 /// Per-connection behavior of the proxy.
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +86,8 @@ pub struct Route {
     backend_metrics: HashMap<SocketAddr, Arc<BackendMetrics>>,
     /// Every connection task of the listener, so shutdown can wait for them.
     connections: TaskTracker,
+    /// Set on the routes of UDP listeners.
+    udp: Option<udp::UdpRoute>,
 }
 
 impl Route {
@@ -106,7 +112,29 @@ impl Route {
             proxy,
             metrics,
             connections,
+            udp: None,
         }
+    }
+
+    /// Makes this the route of a UDP listener. `pods` maps pod names to
+    /// backends of `pool`, for `stun-username`.
+    pub fn with_udp(mut self, settings: UdpSettings, pods: BTreeMap<String, SocketAddr>) -> Self {
+        let backends = self
+            .pool
+            .backends()
+            .iter()
+            .map(|backend| {
+                let addr = backend.addr();
+                (addr, self.metrics.udp_backend(&self.name, addr))
+            })
+            .collect();
+        self.udp = Some(udp::UdpRoute {
+            settings,
+            pods,
+            metrics: self.metrics.udp_listener(&self.name),
+            backends,
+        });
+        self
     }
 
     fn backend_metrics(&self, backend: SocketAddr) -> Arc<BackendMetrics> {
