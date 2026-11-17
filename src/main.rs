@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use notify::{RecursiveMode, Watcher};
 use prometheus_client::registry::Registry;
 use strait::{
     Algorithm, Config, HealthCheckConfig, ListenerConfig, Metrics, MetricsConfig, ReloadResult,
@@ -12,6 +13,7 @@ use strait::{
 };
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -24,6 +26,11 @@ struct Args {
     /// YAML config file; send SIGHUP to reload it without dropping connections
     #[arg(short, long, conflicts_with = "backends")]
     config: Option<PathBuf>,
+
+    /// Reload automatically when the config file changes, including a Kubernetes
+    /// ConfigMap mounted as a directory
+    #[arg(long, requires = "config", conflicts_with = "backends")]
+    watch_config: bool,
 
     /// Address to listen on
     #[arg(short, long, default_value = "127.0.0.1:8080")]
@@ -60,6 +67,11 @@ struct Args {
     /// Serve Prometheus metrics on this address (overrides `metrics.listen` in the config)
     #[arg(long, value_name = "ADDR")]
     metrics: Option<SocketAddr>,
+
+    /// On SIGTERM or Ctrl-C, how long open connections get to finish before they
+    /// are cut; keep it below the pod's terminationGracePeriodSeconds
+    #[arg(long, default_value = "20s", value_parser = humantime::parse_duration)]
+    shutdown_timeout: Duration,
 }
 
 impl Args {
@@ -82,6 +94,7 @@ impl Args {
                 name: "default".into(),
                 listen: self.listen,
                 backends: self.backends.clone(),
+                kubernetes: None,
                 strategy: self.strategy,
                 connect_timeout: self.connect_timeout,
                 idle_timeout: self.idle_timeout,
@@ -130,6 +143,16 @@ async fn main() -> Result<()> {
     }
 
     let mut hangup = signal(SignalKind::hangup())?;
+    // Kubernetes stops pods with SIGTERM. As PID 1 in a container, a signal
+    // without a handler is ignored, so without this every stop would wait for
+    // the grace period and end in SIGKILL.
+    let mut terminate = signal(SignalKind::terminate())?;
+    let (changes, mut changed) = mpsc::unbounded_channel();
+    let _watcher = match (&args.config, args.watch_config) {
+        (Some(path), true) => Some(watch(path, changes)?),
+        _ => None,
+    };
+
     loop {
         tokio::select! {
             _ = hangup.recv() => {
@@ -137,30 +160,84 @@ async fn main() -> Result<()> {
                     warn!("SIGHUP ignored: reloading needs --config");
                     continue;
                 }
-                let reloaded = match args.load_config() {
-                    Ok(config) => {
-                        if config.metrics.map(|m| m.listen) != metrics_listen {
-                            warn!("metrics.listen changed; restart strait to apply it");
-                        }
-                        server.reload(&config).await
-                    }
-                    Err(err) => Err(err),
-                };
-                match reloaded {
-                    Ok(summary) => {
-                        metrics.record_reload(ReloadResult::Success);
-                        info!(%summary, "config reloaded");
-                    }
-                    Err(err) => {
-                        metrics.record_reload(ReloadResult::Failure);
-                        error!(error = format!("{err:#}"), "reload failed, keeping previous config");
-                    }
-                }
+                reload(&args, &mut server, &metrics, metrics_listen).await;
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("shutting down");
-                return Ok(());
+            Some(()) = changed.recv() => {
+                // One save often fires several events; wait for them to settle.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                while changed.try_recv().is_ok() {}
+                info!("config file changed");
+                reload(&args, &mut server, &metrics, metrics_listen).await;
             }
+            _ = terminate.recv() => break,
+            _ = tokio::signal::ctrl_c() => break,
         }
     }
+
+    info!("shutting down, no longer accepting connections");
+    tokio::select! {
+        cut = server.shutdown(args.shutdown_timeout) => {
+            if cut == 0 {
+                info!("all connections finished");
+            } else {
+                warn!(connections = cut, "shutdown timeout reached, closing open connections");
+            }
+        }
+        // A second signal skips the wait.
+        _ = terminate.recv() => warn!("second signal, closing open connections"),
+        _ = tokio::signal::ctrl_c() => warn!("second signal, closing open connections"),
+    }
+    Ok(())
+}
+
+async fn reload(
+    args: &Args,
+    server: &mut Server,
+    metrics: &Metrics,
+    metrics_listen: Option<SocketAddr>,
+) {
+    let reloaded = match args.load_config() {
+        Ok(config) => {
+            if config.metrics.map(|m| m.listen) != metrics_listen {
+                warn!("metrics.listen changed; restart strait to apply it");
+            }
+            server.reload(&config).await
+        }
+        Err(err) => Err(err),
+    };
+    match reloaded {
+        Ok(summary) => {
+            metrics.record_reload(ReloadResult::Success);
+            info!(%summary, "config reloaded");
+        }
+        Err(err) => {
+            metrics.record_reload(ReloadResult::Failure);
+            error!(
+                error = format!("{err:#}"),
+                "reload failed, keeping previous config"
+            );
+        }
+    }
+}
+
+/// Watches the directory that holds `path` and sends a message on every change.
+///
+/// The directory is watched rather than the file because Kubernetes updates a
+/// mounted ConfigMap by swapping a symlink, which a watch on the file would miss.
+fn watch(path: &std::path::Path, changes: mpsc::UnboundedSender<()>) -> Result<impl Watcher> {
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."))
+        .to_owned();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if event.is_ok_and(|event| !event.kind.is_access()) {
+            let _ = changes.send(());
+        }
+    })?;
+    watcher
+        .watch(&dir, RecursiveMode::NonRecursive)
+        .with_context(|| format!("could not watch {}", dir.display()))?;
+    info!(dir = %dir.display(), "watching config for changes");
+    Ok(watcher)
 }
