@@ -146,3 +146,35 @@ async fn does_not_delay_responses_split_over_several_writes() {
         "{stalled} of 200 responses stalled for over 30ms"
     );
 }
+
+#[tokio::test]
+async fn sends_a_proxy_protocol_header_first() {
+    // A backend that records everything it receives.
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend.local_addr().unwrap();
+    let received = tokio::spawn(async move {
+        let (mut socket, _) = backend.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        socket.read_to_end(&mut bytes).await.unwrap();
+        bytes
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let config = ProxyConfig {
+        proxy_protocol: Some(strait::ProxyProtocol::V2),
+        ..ProxyConfig::default()
+    };
+    let pool = Pool::new([backend_addr], Algorithm::RoundRobin);
+    tokio::spawn(strait::run(listener, Arc::new(pool), config));
+
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    let client_addr = client.local_addr().unwrap();
+    client.write_all(b"hello").await.unwrap();
+    client.shutdown().await.unwrap();
+    drop(client);
+
+    let mut expected = strait::proxy_protocol_v2(client_addr, proxy);
+    expected.extend_from_slice(b"hello");
+    assert_eq!(received.await.unwrap(), expected);
+}
