@@ -1,5 +1,6 @@
 //! Runs every listener from a [`Config`] and applies new configs without a restart.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -8,15 +9,16 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use kube::Client;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::task::TaskTracker;
 use tracing::{Instrument, error, info, info_span};
 
 use crate::balancer::Pool;
-use crate::config::{Config, Dataplane, ListenerConfig};
-use crate::discovery;
+use crate::config::{Config, Dataplane, ListenerConfig, Protocol};
+use crate::discovery::{self, Endpoints};
 use crate::health::{self, HealthChecks};
 use crate::metrics::{BackendState, Metrics};
 use crate::{Route, serve};
@@ -44,8 +46,10 @@ struct Running {
     config: ListenerConfig,
     local_addr: SocketAddr,
     upstream: Arc<Upstream>,
-    /// Accept loop of a proxy listener.
+    /// Accept loop of a TCP proxy listener.
     accept: Option<JoinHandle<()>>,
+    /// Tells a UDP proxy listener to stop taking new flows, when dropped.
+    _udp_stop: Option<watch::Sender<()>>,
     discovery: Option<JoinHandle<()>>,
     /// VIP of an XDP listener; dropping it removes the VIP from the data plane.
     #[cfg(feature = "xdp")]
@@ -56,6 +60,7 @@ struct Running {
 enum Frontend {
     /// A bound socket and its actual address, for a proxy listener.
     Socket(TcpListener, SocketAddr),
+    Udp(UdpSocket, SocketAddr),
     #[cfg(feature = "xdp")]
     Xdp(Arc<crate::xdp::DataPlane>),
 }
@@ -81,6 +86,8 @@ struct Upstream {
 struct UpstreamState {
     config: ListenerConfig,
     backends: Vec<SocketAddr>,
+    /// Pod names of `backends`, from Kubernetes.
+    pods: BTreeMap<String, SocketAddr>,
     health: HealthChecks,
 }
 
@@ -186,16 +193,29 @@ impl Server {
                 .iter()
                 .any(|r| same_listener(&r.config, listener));
             if !kept && listener.dataplane == Dataplane::Proxy {
-                let socket = TcpListener::bind(listener.listen).await.with_context(|| {
+                let context = || {
                     format!(
                         "listener {:?}: could not bind {}",
                         listener.name, listener.listen
                     )
-                })?;
-                let local_addr = socket.local_addr().with_context(|| {
-                    format!("listener {:?}: bound address unknown", listener.name)
-                })?;
-                bound.push((listener.listen, socket, local_addr));
+                };
+                let frontend = match listener.protocol {
+                    Protocol::Tcp => {
+                        let socket = TcpListener::bind(listener.listen)
+                            .await
+                            .with_context(context)?;
+                        let local_addr = socket.local_addr().with_context(context)?;
+                        Frontend::Socket(socket, local_addr)
+                    }
+                    Protocol::Udp => {
+                        let socket = UdpSocket::bind(listener.listen)
+                            .await
+                            .with_context(context)?;
+                        let local_addr = socket.local_addr().with_context(context)?;
+                        Frontend::Udp(socket, local_addr)
+                    }
+                };
+                bound.push(((listener.listen, listener.protocol), frontend));
             }
         }
 
@@ -221,12 +241,12 @@ impl Server {
                 None => {
                     let frontend = match listener.dataplane {
                         Dataplane::Proxy => {
+                            let key = (listener.listen, listener.protocol);
                             let index = bound
                                 .iter()
-                                .position(|(addr, _, _)| *addr == listener.listen)
+                                .position(|(bound_key, _)| *bound_key == key)
                                 .expect("every new proxy address was bound above");
-                            let (_, socket, local_addr) = bound.swap_remove(index);
-                            Frontend::Socket(socket, local_addr)
+                            bound.swap_remove(index).1
                         }
                         #[cfg(feature = "xdp")]
                         Dataplane::Xdp => {
@@ -298,6 +318,7 @@ impl Running {
             discovery: start_discovery(&config, &upstream, kube),
             upstream,
             accept: None,
+            _udp_stop: None,
             #[cfg(feature = "xdp")]
             _xdp: None,
             config,
@@ -314,6 +335,22 @@ impl Running {
                     }
                     .instrument(span),
                 ));
+            }
+            Frontend::Udp(socket, local_addr) => {
+                let route = Arc::clone(&running.upstream.route);
+                let (stop, stopped) = watch::channel(());
+                running.local_addr = local_addr;
+                running._udp_stop = Some(stop);
+                // Tracked like connections: after the listener goes, its task
+                // keeps relaying the open flows, and shutdown waits for it.
+                connections.spawn(
+                    async move {
+                        if let Err(err) = crate::serve_udp(socket, route, stopped).await {
+                            error!(error = %err, "listener stopped");
+                        }
+                    }
+                    .instrument(span),
+                );
             }
             #[cfg(feature = "xdp")]
             Frontend::Xdp(dataplane) => {
@@ -357,8 +394,8 @@ fn start_discovery(
         client.clone(),
         source,
         span,
-        move |backends| {
-            upstream.set_backends(backends);
+        move |endpoints| {
+            upstream.set_backends(endpoints);
         },
     ))
 }
@@ -378,14 +415,15 @@ impl Upstream {
     fn new(config: ListenerConfig, metrics: Arc<Metrics>, connections: TaskTracker) -> Self {
         // Kubernetes listeners start empty and fill in on the first endpoint list.
         let backends = config.backends.clone();
+        let pods = BTreeMap::new();
         let pool = Arc::new(Pool::new(backends.iter().copied(), config.strategy));
         let health = health::spawn(&pool, config.health());
-        let route = Arc::new(ArcSwap::from_pointee(Route::new(
-            config.name.as_str(),
+        let route = Arc::new(ArcSwap::from_pointee(route(
+            &config,
             pool,
-            config.proxy(),
-            Arc::clone(&metrics),
-            connections.clone(),
+            &pods,
+            &metrics,
+            &connections,
         )));
         Self {
             route,
@@ -394,6 +432,7 @@ impl Upstream {
             state: Mutex::new(UpstreamState {
                 config,
                 backends,
+                pods,
                 health,
             }),
         }
@@ -405,15 +444,17 @@ impl Upstream {
         let mut state = self.state.lock().expect("upstream lock poisoned");
         if config.kubernetes.is_none() {
             state.backends = config.backends.clone();
+            state.pods.clear();
         }
         state.config = config;
         self.apply(&mut state);
     }
 
-    /// New backend list from discovery.
-    fn set_backends(&self, backends: Vec<SocketAddr>) {
+    /// New endpoints from discovery.
+    fn set_backends(&self, endpoints: Endpoints) {
         let mut state = self.state.lock().expect("upstream lock poisoned");
-        state.backends = backends;
+        state.backends = endpoints.backends;
+        state.pods = endpoints.pods;
         self.apply(&mut state);
     }
 
@@ -429,13 +470,34 @@ impl Upstream {
         // Backends that stay keep their running check; see `HealthChecks::update`.
         let health = config.health();
         state.health.update(&pool, health);
-        self.route.store(Arc::new(Route::new(
-            config.name.as_str(),
+        self.route.store(Arc::new(route(
+            config,
             pool,
-            config.proxy(),
-            Arc::clone(&self.metrics),
-            self.connections.clone(),
+            &state.pods,
+            &self.metrics,
+            &self.connections,
         )));
+    }
+}
+
+fn route(
+    config: &ListenerConfig,
+    pool: Arc<Pool>,
+    pods: &BTreeMap<String, SocketAddr>,
+    metrics: &Arc<Metrics>,
+    connections: &TaskTracker,
+) -> Route {
+    let route = Route::new(
+        config.name.as_str(),
+        pool,
+        config.proxy(),
+        Arc::clone(metrics),
+        connections.clone(),
+    );
+    if config.protocol == Protocol::Udp && config.dataplane == Dataplane::Proxy {
+        route.with_udp(config.udp(), pods.clone())
+    } else {
+        route
     }
 }
 
