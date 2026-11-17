@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::ProxyConfig;
+use crate::ProxyProtocol;
 use crate::balancer::Algorithm;
 use crate::health::HealthCheck;
 
@@ -167,6 +168,10 @@ pub struct ListenerConfig {
     pub retries: usize,
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+    /// PROXY protocol header sent to backends, so they see the client's
+    /// address. Proxy listeners only.
+    #[serde(default)]
+    pub proxy_protocol: Option<ProxyProtocol>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -343,6 +348,13 @@ impl ListenerConfig {
                 "health checks are TCP connects: a udp listener needs health_check.port (a TCP port on the backends) or health_check.enabled: false"
             );
         }
+        if self.proxy_protocol.is_some() && self.dataplane == Dataplane::Xdp {
+            // Packets go to the backends as they are, with the client's own
+            // address: there is no connection of strait's to put a header on.
+            bail!(
+                "proxy_protocol is for proxy listeners; with dataplane xdp, backends already see the client's address"
+            );
+        }
         if self.dataplane == Dataplane::Xdp {
             // The VIP is not bound to a socket: packets to it are caught on the
             // wire, so it needs a real address and port.
@@ -376,6 +388,7 @@ impl ListenerConfig {
             connect_timeout: self.connect_timeout,
             idle_timeout: self.idle_timeout,
             retries: self.retries,
+            proxy_protocol: self.proxy_protocol,
         }
     }
 
@@ -579,6 +592,21 @@ listeners:
                 Some(1500)
             );
             assert!(error(&mtu("500")).contains("at least 576"));
+        }
+    }
+
+    #[test]
+    fn parses_proxy_protocol() {
+        let text = "listeners:\n  - name: a\n    listen: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n    proxy_protocol: v2\n";
+        let config = Config::parse(text).unwrap();
+        assert_eq!(
+            config.listeners[0].proxy().proxy_protocol,
+            Some(ProxyProtocol::V2)
+        );
+        assert!(error(&text.replace("v2", "v1")).contains("unknown variant"));
+        if cfg!(feature = "xdp") {
+            let xdp = XDP.replace("dataplane: xdp", "dataplane: xdp\n    proxy_protocol: v2");
+            assert!(error(&xdp).contains("proxy_protocol is for proxy listeners"));
         }
     }
 
