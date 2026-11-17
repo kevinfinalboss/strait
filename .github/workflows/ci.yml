@@ -23,3 +23,26 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+
+  xdp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Install bpf-linker
+        run: |
+          curl -sSfL https://github.com/aya-rs/bpf-linker/releases/download/v0.13.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst \
+            | tar --zstd -x -C "$HOME/.cargo/bin" bpf-linker
+          bpf-linker --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: xdp
+      - name: Lint
+        run: cargo +stable clippy --all-targets --features xdp -- -D warnings
+      - name: Test
+        run: cargo +stable test --features xdp --lib
