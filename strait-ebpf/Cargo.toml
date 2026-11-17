@@ -1,0 +1,15 @@
+[package]
+name = "strait-ebpf"
+version = "0.1.0"
+edition = "2024"
+description = "strait's XDP data plane, built for the BPF target by the strait build script"
+license = "MIT"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.3.0"
+strait-common = { path = "../strait-common" }
+
+[[bin]]
+name = "strait-xdp"
+path = "src/main.rs"
