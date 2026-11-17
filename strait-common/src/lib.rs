@@ -86,7 +86,10 @@ pub struct Settings {
     /// Next hop for encapsulated packets, which leave through the interface
     /// they arrived on.
     pub gateway_mac: [u8; 6],
-    pub _pad: [u8; 2],
+    /// Largest IP packet the path to the backends carries, outer header
+    /// included. A packet that would not fit once encapsulated is answered
+    /// with an ICMP "too big" error instead. 0 turns the check off.
+    pub mtu: u16,
 }
 
 /// Counters of one VIP, in the per-CPU `STATS` map indexed by VIP slot.
@@ -104,6 +107,9 @@ pub struct VipStats {
     /// Packets dropped for another reason: the backend has another address
     /// family than the packet, or there was no headroom for the outer header.
     pub dropped: u64,
+    /// Packets too big to forward once encapsulated, answered with an ICMP
+    /// "fragmentation needed" (IPv4) or "packet too big" (IPv6) error.
+    pub too_big: u64,
 }
 
 #[cfg(feature = "user")]
@@ -161,4 +167,75 @@ fn mix(h: u32, value: u32) -> u32 {
     .rotate_left(13)
     .wrapping_mul(5)
     .wrapping_add(0xe654_6b64)
+}
+
+/// Adds `bytes` to an Internet checksum (RFC 1071) as big-endian 16-bit words.
+/// `N` must be even.
+#[inline(always)]
+pub fn checksum_add<const N: usize>(mut sum: u32, bytes: &[u8; N]) -> u32 {
+    let mut i = 0;
+    while i + 1 < N {
+        sum += u32::from(u16::from_be_bytes([bytes[i], bytes[i + 1]]));
+        i += 2;
+    }
+    sum
+}
+
+/// Folds a sum from [`checksum_add`] into the checksum to write in a header.
+/// The sum must stay below 2^32, which holds for anything under 128 KiB.
+#[inline(always)]
+pub fn checksum_finish(mut sum: u32) -> u16 {
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    !(sum as u16)
+}
+
+/// Start of an ICMPv6 checksum: the IPv6 pseudo-header (RFC 8200, 8.1) of a
+/// message of `len` bytes from `src` to `dst`.
+#[inline(always)]
+pub fn icmpv6_pseudo_header(src: &[u8; 16], dst: &[u8; 16], len: u16) -> u32 {
+    /// Next header value of ICMPv6.
+    const ICMPV6: u32 = 58;
+    checksum_add(checksum_add(0, src), dst) + u32::from(len) + ICMPV6
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checksum_matches_rfc_1071() {
+        // The worked example of RFC 1071, section 3.
+        let sum = checksum_add(0, &[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7]);
+        assert_eq!(checksum_finish(sum), !0xddf2);
+    }
+
+    #[test]
+    fn a_packet_with_its_checksum_sums_to_zero() {
+        // An IPv4 header from the wild, checksum (bytes 10 and 11) zeroed.
+        let mut header = [
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
+            0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7,
+        ];
+        let check = checksum_finish(checksum_add(0, &header));
+        assert_eq!(check, 0xb861);
+        header[10..12].copy_from_slice(&check.to_be_bytes());
+        assert_eq!(checksum_finish(checksum_add(0, &header)), 0);
+    }
+
+    #[test]
+    fn icmpv6_checksum_covers_the_pseudo_header() {
+        // Echo request from fe80::1 to fe80::2, id 0x1234, seq 1, no data.
+        // Reference value computed separately over the full pseudo-header.
+        let src = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let message = [128, 0, 0, 0, 0x12, 0x34, 0x00, 0x01];
+        let sum = checksum_add(icmpv6_pseudo_header(&src, &dst, 8), &message);
+        let check = checksum_finish(sum);
+        assert_eq!(check, 0x7083);
+        let mut message = message;
+        message[2..4].copy_from_slice(&check.to_be_bytes());
+        let sum = checksum_add(icmpv6_pseudo_header(&src, &dst, 8), &message);
+        assert_eq!(checksum_finish(sum), 0);
+    }
 }
